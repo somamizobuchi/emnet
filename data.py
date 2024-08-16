@@ -249,7 +249,7 @@ class KyotoNaturalImages(Dataset):
         images = []
         for file in tqdm(files):
             if file.endswith('.mat'):
-                image = loadmat(os.path.join(root, file))['OM'].astype(np.float)
+                image = loadmat(os.path.join(root, file))['OM'].astype(float)
             else:
                 image = np.array(Image.open(os.path.join(root, file)).convert('L')).astype(np.float)
 
@@ -338,7 +338,7 @@ class EMSequenceDataset(Dataset):
             self.traces[:,:,i] = trace
 
     def __len__(self):
-        return 128000  # any large number should work, since we don't care about "epoch" for now
+        return len(self.images) * self.traces.shape[-1]  # any large number should work, since we don't care about "epoch" for now
 
     def __getitem__(self, index):
         # im_size = 1024
@@ -356,8 +356,15 @@ class EMSequenceDataset(Dataset):
 
         return seq
 
-    def covariance(self, num_samples: int = 10000, device: Union[str, torch.device] = None, index=0):
-        return estimated_covariance(self, num_samples, device, index)
+    def covariance(self, num_samples: int = 10000, device: Union[str, torch.device] = None):
+        loop = trange(num_samples, desc="Taking samples for covariance calculation", ncols=99)
+        samples = torch.stack([self[np.random.randint(0, len(self)-1)].flatten() for _ in loop])  # / dataset.mask
+        if device is not None:
+            samples = samples.to(device)
+        samples -= samples.mean(dim=0, keepdim=True)
+        C = samples.t() @ samples / num_samples
+        C = (C + C.t()) / 2.0  # make it numerically symmetric
+        return C
     
 
 def get_dataset(data: str, kernel_size: Union[int, Tuple[int, int]], frames: int, circle_masking: bool,
