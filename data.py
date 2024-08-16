@@ -13,6 +13,8 @@ from tqdm import trange, tqdm
 
 from temporal import preset_temp
 
+from util import natural_noise, brownian_eye_trace, generate_saccade, crop_image
+
 
 def circular_mask(kernel_size: int):
     """
@@ -95,7 +97,9 @@ class VideoDataset(Dataset):
         video, mean, std = self.videos[index]
 
         # begin = np.random.choice(video.shape[0] - self.frames)
-        begin = np.random.choice(min(800, video.shape[0]) - self.frames)
+        # begin = np.random.choice(min(800, video.shape[0]) - self.frames)
+        #begin = np.random.choice(self.frames)
+        begin = 0
         end = begin + self.frames
         top = np.random.choice(video.shape[1] - self.kernel_size[0])
         bottom = top + self.kernel_size[0]
@@ -284,6 +288,77 @@ class KyotoNaturalImages(Dataset):
     def covariance(self, num_samples: int = 100000, device: Union[str, torch.device] = None, index=0):
         return estimated_covariance(self, num_samples, device, index)
 
+class EMSequenceDataset(Dataset):
+    def __init__(self,
+                 kernel_size: Union[int, Tuple[int, int]],
+                 frames: int,
+                 group_size: Optional[int],
+                 random_flip: bool = False,
+                 ppd: int = 120,
+                 fsamp: int = 1000,
+                 device: str = 'cuda'):
+
+        if isinstance(kernel_size, int):
+            self.kernel_size = [kernel_size, kernel_size]
+        else:
+            self.kernel_size = kernel_size
+        self.frames = frames
+        self.group_size = group_size
+        self.random_flip = random_flip
+        self.ppd = ppd
+        self.fsamp = fsamp
+        self.device = device
+
+        n_images = 100
+        self.traces = np.zeros([2, self.frames, 1000000 // n_images], int)
+
+        # Pre-load images
+        # for i in tqdm(range(0, self.images.shape[2]), "Generating images"):
+        #     self.images[:,:,i] = natural_noise(1024)
+        root = "upenn"
+        files = [mat for mat in os.listdir(root) if mat.endswith('.mat')]
+        print("Loading {} images from {} ...".format(len(files), root))
+
+        images = []
+        for file in tqdm(files):
+            # image = loadmat(os.path.join(root, file))['OM'].astype(np.float)
+            image = loadmat(os.path.join(root, file))['LUM_Image'].astype(float);
+            std = np.std(image)
+            if std < 1e-4:
+                continue
+            image -= np.mean(image)
+            image /= std
+            images.append(torch.from_numpy(image).to(device))
+        self.images = images;
+
+        for i in tqdm(range(0, self.traces.shape[2]), "Generating traces"):
+            trace = brownian_eye_trace(20, 300, self.frames) / 60
+            trace = np.round(trace * self.ppd + 1024 / 2).astype(int)
+            trace = trace + np.random.randint(-255, 256, [2, 1]) 
+            self.traces[:,:,i] = trace
+
+    def __len__(self):
+        return 128000  # any large number should work, since we don't care about "epoch" for now
+
+    def __getitem__(self, index):
+        # im_size = 1024
+        # im = natural_noise(im_size)
+        # sacc = generate_saccade(np.random.gamma(1.40, 4.92), 0., self.fsamp)
+        # drift = brownian_eye_trace(20, self.fsamp, self.frames - sacc.shape[1], index) / 50
+        # drift = sacc[:, -1][:,np.newaxis] + drift
+        # trace = np.hstack((sacc, drift))
+        img_idx, trace_idx = np.unravel_index(index, [len(self.images), self.traces.shape[2]])
+
+        seq = torch.zeros((self.frames, self.kernel_size[0], self.kernel_size[1]))
+        for i in range(0, self.frames):
+            roi = crop_image(self.images[img_idx], self.kernel_size[0], self.traces[:,i,trace_idx])
+            seq[i,:,:] = roi;
+
+        return seq
+
+    def covariance(self, num_samples: int = 10000, device: Union[str, torch.device] = None, index=0):
+        return estimated_covariance(self, num_samples, device, index)
+    
 
 def get_dataset(data: str, kernel_size: Union[int, Tuple[int, int]], frames: int, circle_masking: bool,
                 group_size: Optional[int], random_flip: bool, neural_type: Optional[str], input_noise: Optional[float]):
@@ -301,3 +376,5 @@ def get_dataset(data: str, kernel_size: Union[int, Tuple[int, int]], frames: int
         return KyotoNaturalImages("kyoto", kernel_size, circle_masking, device='cuda')
 
     return VideoDataset(data, kernel_size, frames, circle_masking, group_size, random_flip)
+
+

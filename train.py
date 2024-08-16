@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
-from data import get_dataset, KyotoNaturalImages
+from data import get_dataset, KyotoNaturalImages, EMSequenceDataset
 from model import Retina, OutputTerms, OutputMetrics
 from util import cycle, kernel_images, plot_convolution
 
@@ -39,7 +39,7 @@ def train(logdir: str = datetime.now().strftime(f"{gettempdir()}/%y%m%d-%H%M%S")
           same_video_batch: bool = False,  # sampling minibatch from a single video file
           random_flip: bool = True,  # random up-and-down, left-and-right video flip after sampling the batch
           batch_size: int = 128,
-          data: str = "palmer",
+          data: str = "em",
           kernel_size: int = 18,  # kernel shape is kernel_size * kernel_size (square shape)
           temporal_kernel_size: int = 20,
           input_padding: Optional[str] = None,  # ["data", "zero"]
@@ -100,6 +100,8 @@ def train(logdir: str = datetime.now().strftime(f"{gettempdir()}/%y%m%d-%H%M%S")
         assert frames == 1
         assert temporal_kernel_size == 1
         dataset = KyotoNaturalImages("kyoto", kernel_size, circle_masking, device=device)
+    elif data == "em":
+        dataset = EMSequenceDataset(kernel_size, frames, 0, False, 360)
     else:
         dataset = get_dataset(data, kernel_size, data_frames, circle_masking, group_size, random_flip, neural_type, input_noise)
 
