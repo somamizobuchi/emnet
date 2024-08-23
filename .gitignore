@@ -2,3 +2,4 @@ emnet_env/
 .vscode/
 __pycache__/
 upenn_fixations/
+data/
