@@ -35,7 +35,7 @@ def set_seed(seed=None, seed_torch=True):
 
 
 def train(logdir: str = datetime.now().strftime(f"{gettempdir()}/%y%m%d-%H%M%S"),
-          iterations: int = 500000,
+          iterations: int = 250000,
           same_video_batch: bool = False,  # sampling minibatch from a single video file
           random_flip: bool = True,  # random up-and-down, left-and-right video flip after sampling the batch
           batch_size: int = 128,
