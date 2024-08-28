@@ -309,82 +309,54 @@ class EMSequenceDataset(Dataset):
         self.fsamp = fsamp
         self.device = device
 
-        n_images = 100
-        self.traces = np.zeros([2, self.frames, 1000000 // n_images], int)
-
-        # Pre-load images
-        # for i in tqdm(range(0, self.images.shape[2]), "Generating images"):
-        #     self.images[:,:,i] = natural_noise(1024)
-        root = "upenn_fixations"
-        # files = [mat for mat in os.listdir(root) if mat.endswith('.mat')]
-        
+        # Load images
+        root = "upenn"
         self.files = sorted(glob(f"{root}/*.npy"))
-        print("Loading {} fixations from {} ...".format(len(self.files), root))
+        print("Loading {} images from {} ...".format(len(self.files), root))
+        self.images= []
+        for file in tqdm(self.files, desc="Loading images", ncols=100):
+            image = np.load(file, mmap_mode='r')
+            self.images.append(image)
 
-        # fixations_per_image = 5
+        # Prepare traces
+        self.n_traces = 10000
+        self.eye_traces = []
+        for _ in trange(self.n_traces, desc="Generating eye traces", ncols=100):
+            eye_trace = brownian_eye_trace(20, self.fsamp, self.frames) / 60 * self.ppd;
+            eye_trace = eye_trace.round().astype(int)
+            eye_trace -= eye_trace[:,0][:,np.newaxis]
+            self.eye_traces.append(eye_trace)
 
-        self.videos = []
-        for file in tqdm(self.files):
-            # image = loadmat(os.path.join(root, file))['OM'].astype(np.float)
-            # image = loadmat(os.path.join(root, file))['LUM_Image'].astype(float);
-            # std = np.std(image)
-            # if std < 1e-4:
-            #     continue
-            # image -= np.mean(image)
-            # image /= std
-            
-            # images.append(torch.from_numpy(image).to(device))
-            video = np.load(file, mmap_mode='r')
-            self.videos.append(video)
-
-        # for i in tqdm(range(0, self.traces.shape[2]), "Generating traces"):
-        #     trace = brownian_eye_trace(20, 300, self.frames) / 60
-        #     trace = np.round(trace * self.ppd + 1024 / 2).astype(int)
-        #     trace = trace + np.random.randint(-255, 256, [2, 1]) 
-        #     self.traces[:,:,i] = trace
+        # Preallocate
+        self.current_sequence = np.zeros((self.frames, self.kernel_size[0], self.kernel_size[1]), np.float32)
 
     def __len__(self):
         return 10000000
 
     def __getitem__(self, index):
+        pad = 50
         rng = np.random.default_rng(seed=index)
-        img_idx = rng.integers(0, len(self.files))
-        t_idx = rng.integers(0, self.videos[img_idx].shape[0] - self.frames)
-        y_idx = rng.integers(0, self.videos[img_idx].shape[1] - self.kernel_size[0])
-        x_idx = rng.integers(0, self.videos[img_idx].shape[2] - self.kernel_size[1])
-        seq = self.videos[img_idx][t_idx:t_idx+self.frames, 
-                             y_idx:y_idx+self.kernel_size[0], 
-                             x_idx:x_idx+self.kernel_size[1]]
-        # img_idx = np.random.randint(0, len(self.files))
-        # video = self.videos[img_idx]
-        # t_idx = np.random.randint(0, video.shape[0] - self.frames)
-        # y_idx = np.random.randint(0, video.shape[1] - self.kernel_size[0])
-        # x_idx = np.random.randint(0, video.shape[2] - self.kernel_size[1])
-        # seq = video[t_idx:t_idx+self.frames, 
-        #                      y_idx:y_idx+self.kernel_size[0], 
-        #                      x_idx:x_idx+self.kernel_size[1]]
-        # im_size = 1024
-        # im = natural_noise(im_size)
-        # sacc = generate_saccade(np.random.gamma(1.40, 4.92), 0., self.fsamp)
-        # drift = brownian_eye_trace(20, self.fsamp, self.frames - sacc.shape[1], index) / 50
-        # drift = sacc[:, -1][:,np.newaxis] + drift
-        # trace = np.hstack((sacc, drift))
-        # img_idx, trace_idx = np.unravel_index(index, [len(self.images), self.traces.shape[2]])
+        img = self.images[rng.integers(len(self.images))]
+        eye_trace = self.eye_traces[rng.integers(len(self.eye_traces))]
+        start_idx = np.array([
+            rng.integers(pad, img.shape[1] - self.kernel_size[1] - pad), 
+            rng.integers(pad, img.shape[0] - self.kernel_size[0] - pad)])
+        roi = eye_trace + start_idx[:,np.newaxis]
 
-        # seq = torch.zeros((self.frames, self.kernel_size[0], self.kernel_size[1]))
-        # for i in range(0, self.frames):
-        #     roi = crop_image(self.images[img_idx], self.kernel_size[0], self.traces[:,i,trace_idx])
-        #     seq[i,:,:] = roi;
-        
+        seq = np.zeros((self.frames, self.kernel_size[0], self.kernel_size[1]), np.float32)
+        for t in range(0, self.frames):
+            seq[t,:,:] = img[roi[1,t]:(roi[1,t]+self.kernel_size[1]), roi[0,t]:(roi[0,t]+self.kernel_size[0])]
 
-        return torch.from_numpy(seq.copy())
+        return torch.from_numpy(seq)
 
     def covariance(self, num_samples: int = 100000, device: Union[str, torch.device] = None):
-        loop = trange(num_samples, desc="Taking samples for covariance calculation", ncols=99)
-        samples = torch.stack([self[np.random.randint(0, len(self))].flatten() for _ in loop])  # / dataset.mask
+        loop = trange(num_samples, desc="Sampling for covariance", ncols=100)
+        samples = torch.stack([self[np.random.randint(len(self))].flatten() for _ in loop])  # / dataset.mask
+
         if device is not None:
             samples = samples.to(device)
         samples -= samples.mean(dim=0, keepdim=True)
+            
         C = samples.t() @ samples / num_samples
         C = (C + C.t()) / 2.0  # make it numerically symmetric
         return C

@@ -81,7 +81,7 @@ def natural_noise(size):
     return im
 
 
-def brownian_eye_trace(D: np.double, fs: int, n: int, seed: int = None) -> np.array:
+def brownian_eye_trace(D: np.double, fs: int, n: int, rng: np.random.Generator = None) -> np.array:
     """
     Creates simulated eye traces based on brownian motion
 
@@ -99,11 +99,11 @@ def brownian_eye_trace(D: np.double, fs: int, n: int, seed: int = None) -> np.ar
     tuple
         A 2-by-n array of eye traces for x and y eye traces
     """
-    if seed:
-        rng = np.random.default_rng(seed=seed)
+    if rng != None:
         trace = rng.normal(0., 1., (2, n))
     else:
         trace = np.random.normal(0., 1., (2,n))
+
     K = np.sqrt(2.*D / fs)
     return np.cumsum(K * trace, axis=1)
 
@@ -111,7 +111,7 @@ def brownian_eye_trace(D: np.double, fs: int, n: int, seed: int = None) -> np.ar
 def crop_image(img, roi_size, center):
     return img[center[1]-roi_size//2:center[1]+roi_size//2, center[0]-roi_size//2:center[0]+roi_size//2]
 
-def implay(seq, interval = 20, repeat = False, repeat_delay = -1):
+def implay(seq, interval = 20, repeat = False, repeat_delay = -1, save_name: str = None):
     """
     Plays a sequence of gray images (2D arrays)
 
@@ -132,6 +132,11 @@ def implay(seq, interval = 20, repeat = False, repeat_delay = -1):
         video.append([implt])
 
     ani = animation.ArtistAnimation(fig, video, interval=interval, blit=True, repeat=repeat, repeat_delay=repeat_delay)
+    
+    if (save_name is not None):
+        writer = animation.FFMpegWriter(fps=20)
+        ani.save(save_name, writer=writer)
+
     plt.show()
 
     

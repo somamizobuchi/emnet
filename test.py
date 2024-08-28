@@ -8,9 +8,11 @@ from glob import glob
 
 matplotlib.use("Qt5Agg")
 
+np.random.seed(1)
 
-kernel_size = 18 
-frames = 10 
+
+kernel_size = 18
+frames = 20 
 circle_masking = False
 group_size = None
 random_flip = False
@@ -33,8 +35,10 @@ dataset = EMSequenceDataset(kernel_size, frames, group_size=None, ppd=60, fsamp=
 # dataset = VideoDataset("palmer", kernel_size, frames, circle_masking, group_size, random_flip)
 # dataset = KyotoNaturalImages("kyoto", kernel_size, circle_masking, device='cuda')
 
-# im = dataset[100]
-# implay(np.transpose(im.cpu(), (1, 2, 0)), repeat=True, repeat_delay=10)
+
+# for i in range(10):
+#     im = dataset[i]
+#     implay(np.transpose(im.cpu(), (1, 2, 0)), repeat=True, repeat_delay=10)
 # plt.hist(im.flatten())
 # plt.show()
 
@@ -44,6 +48,6 @@ data_cov = dataset.covariance()
 # print(data_cov.shape)
 # H_X = torch.linalg.cholesky(data_cov).diag().log2().sum().item() + data_cov.shape[0] / 2.0 * np.log2(2 * np.pi * np.e)
 
-dataset = np.zeros((3, 2, 2))
+# dataset = np.zeros((3, 2, 2))
 
 
