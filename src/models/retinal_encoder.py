@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class RetinalEncoder(nn.Module):
@@ -19,13 +18,32 @@ class RetinalEncoder(nn.Module):
         self.target_firing_rate = target_firing_rate
         self.rho = rho
 
-        self.spatial_kernels = nn.Parameter(
-            torch.zeros(self.N, self.X, self.X, dtype=torch.float32)
+        # Use nn.Linear for spatial projection
+        self.spatial_projection = nn.Linear(self.X * self.X, self.N, bias=False)
+
+        # Use nn.Conv1d for temporal filtering (depthwise convolution)
+        self.temporal_conv = nn.Conv1d(
+            self.N, self.N, kernel_size=self.T, groups=self.N, bias=False
         )
-        self.temporal_kernels = nn.Parameter(torch.zeros(self.N, self.T))
+
+        # Initialize with small random values and normalize
+        nn.init.normal_(self.spatial_projection.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.temporal_conv.weight, mean=0.0, std=0.01)
+
+        # Normalize spatial and temporal weights to unit norm
+        with torch.no_grad():
+            # Spatial: weight is (N, X*X), normalize along dim=1
+            self.spatial_projection.weight.copy_(
+                self.spatial_projection.weight / self.spatial_projection.weight.norm(dim=1, keepdim=True)
+            )
+            # Temporal: weight is (N, 1, T), squeeze, normalize, unsqueeze
+            temp_weight = self.temporal_conv.weight.squeeze(1)  # (N, T)
+            temp_weight = temp_weight / temp_weight.norm(dim=1, keepdim=True)
+            self.temporal_conv.weight.copy_(temp_weight.unsqueeze(1))
+
         self.nonlinear = nn.Softplus()
 
-        # Lagrange multiplier for firing rate constraint
+        # Lagrange multiplier for firing rate constraint (initialized to zero)
         self.register_parameter(
             "Lambda",
             nn.Parameter(torch.zeros(self.N)),
@@ -35,13 +53,18 @@ class RetinalEncoder(nn.Module):
         """
         x: (b, t, x, x)
         """
-        r = torch.matmul(
-                x.view([x.shape[0], -1, self.X * self.X]),
-                self.spatial_kernels.view([-1, self.X * self.X]).T) # (b, t, N)
-        # Valid channel-wise temporal convolution
-        r = F.conv1d(r.transpose_(1, 2), self.temporal_kernels.unsqueeze(1), groups=self.N)
+        # Reshape and apply spatial projection
+        # x: (batch, time, X, X) -> (batch, time, X*X)
+        x_flat = x.view([x.shape[0], -1, self.X * self.X])
+        r = self.spatial_projection(x_flat)  # (batch, time, N)
 
-        return self.nonlinear(r) # (b, N, t - T + 1)
+        # Transpose for temporal convolution: (batch, time, N) -> (batch, N, time)
+        r = r.transpose(1, 2)
+
+        # Apply depthwise temporal convolution
+        r = self.temporal_conv(r)  # (batch, N, time - T + 1)
+
+        return self.nonlinear(r)  # (batch, N, time - T + 1)
 
     def compute_firing_rate_constraint(
         self,
@@ -84,7 +107,14 @@ class RetinalEncoder(nn.Module):
             self.Lambda.add_(self.rho * constraint_violation)
 
     def normalize_kenels(self):
+        """Normalize spatial and temporal kernels to unit L2 norm per channel."""
         with torch.no_grad():
-            kernels_flat = self.spatial_kernels.view([-1, self.X * self.X])
-            self.spatial_kernels.copy_((kernels_flat / kernels_flat.norm(dim=1, keepdim=True)).reshape([-1, self.X, self.X]))
-            self.temporal_kernels.copy_(self.temporal_kernels / self.temporal_kernels.norm(dim=1, keepdim=True))
+            # Normalize spatial projection weights: (N, X*X) -> normalize along dim=1
+            self.spatial_projection.weight.copy_(
+                self.spatial_projection.weight / self.spatial_projection.weight.norm(dim=1, keepdim=True)
+            )
+
+            # Normalize temporal convolution weights: (N, 1, T) -> squeeze, normalize, unsqueeze
+            temp_weight = self.temporal_conv.weight.squeeze(1)  # (N, T)
+            temp_weight = temp_weight / temp_weight.norm(dim=1, keepdim=True)
+            self.temporal_conv.weight.copy_(temp_weight.unsqueeze(1))
