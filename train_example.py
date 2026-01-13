@@ -70,6 +70,7 @@ def main():
         batch_size=8,
         learning_rate=1e-3,
         device=device,
+        log_dir="runs/training",
     )
 
     # Train

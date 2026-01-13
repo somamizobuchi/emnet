@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.4.0",
     "torch>=2.9.1",
     "tqdm>=4.67.1",
+    "tensorboard>=2.14.0",
 ]
 
 [build-system]

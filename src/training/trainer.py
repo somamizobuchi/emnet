@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
 from tqdm import tqdm
 
@@ -25,6 +26,7 @@ class Trainer:
         batch_size: int = 8,
         learning_rate: float = 1e-3,
         device: str = "cpu",
+        log_dir: Optional[str] = None,
     ):
         """
         Initialize trainer.
@@ -35,6 +37,7 @@ class Trainer:
             batch_size: Batch size for data loading
             learning_rate: Learning rate for optimizer
             device: Device to train on ("cpu" or "cuda")
+            log_dir: Directory for tensorboard logs (default: None, no logging)
         """
         self.model = model.to(device)
         self.dataset = dataset
@@ -52,6 +55,9 @@ class Trainer:
 
         # Optimizer
         self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+        # Tensorboard logging
+        self.writer = SummaryWriter(log_dir) if log_dir else None
 
         # Training state
         self.iteration = 0
@@ -131,6 +137,14 @@ class Trainer:
 
         self.iteration += 1
 
+        # Log to tensorboard
+        if self.writer:
+            self.writer.add_scalar("loss/total", total_loss.item(), self.iteration)
+            self.writer.add_scalar("loss/reconstruction", recon_loss.item(), self.iteration)
+            self.writer.add_scalar("loss/alm", alm_loss.item(), self.iteration)
+            self.writer.add_scalar("constraint/violation_mean", constraint_violation.mean().item(), self.iteration)
+            self.writer.add_scalar("constraint/violation_max", constraint_violation.abs().max().item(), self.iteration)
+
         # Return metrics
         return {
             "iteration": self.iteration,
@@ -164,5 +178,10 @@ class Trainer:
                 "alm": f"{metrics['alm_loss']:.2f}",
                 "constraint": f"{metrics['constraint_violation_mean']:+.4f}",
             })
+
+        if self.writer:
+            self.writer.flush()
+            self.writer.close()
+            print(f"\nTensorboard logs saved to: {self.writer.log_dir}")
 
         print(f"\nTraining complete! Final iteration: {self.iteration}")
