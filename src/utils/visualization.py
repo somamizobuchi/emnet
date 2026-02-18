@@ -5,12 +5,14 @@ import io
 from typing import Optional
 
 
-def plot_temporal_kernels(weights: torch.Tensor) -> torch.Tensor:
+def plot_temporal_kernels(weights: torch.Tensor, title: str = "Temporal Kernels", delay: int = 0) -> torch.Tensor:
     """
     Plot all temporal kernels overlaid.
 
     Args:
-        weights (torch.Tensor): Temporal weights of shape (N, T)
+        weights (torch.Tensor): Temporal weights of shape (N, T), including any delay zeros
+        title (str): Plot title
+        delay (int): Number of leading zero (delay) samples — drawn as a shaded region
 
     Returns:
         torch.Tensor: Image tensor of shape (3, H, W)
@@ -18,8 +20,12 @@ def plot_temporal_kernels(weights: torch.Tensor) -> torch.Tensor:
     weights_np = weights.detach().cpu().numpy()
     fig = plt.figure(figsize=(8, 6))
     plt.plot(weights_np.T, alpha=0.3)
-    plt.title("RGC Temporal Kernels")
-    plt.xlabel("Time")
+    if delay > 0:
+        T = weights_np.shape[1]
+        plt.axvspan(T - delay - 0.5, T - 0.5, color="gray", alpha=0.15, label=f"delay ({delay} samples)")
+        plt.legend(fontsize=8)
+    plt.title(title)
+    plt.xlabel("Sample")
     plt.ylabel("Weight")
     plt.grid(True, alpha=0.3)
 

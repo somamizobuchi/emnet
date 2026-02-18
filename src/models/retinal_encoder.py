@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from ..utils.constraints import make_raised_cosine_basis
 
 
 class RetinalEncoder(nn.Module):
@@ -8,41 +11,71 @@ class RetinalEncoder(nn.Module):
         n_channels: int,
         n_spatial: int,
         n_temporal: int,
+        delay: int = 0,
+        n_basis: int = 0,
+        log_offset: float = 1.0,
         target_firing_rate: float = 1.0,
         rho: float = 1.0,
     ) -> None:
+        """
+        Args:
+            n_channels         : Number of RGC channels.
+            n_spatial          : Spatial ROI side length (pixels).
+            n_temporal         : Total kernel length including delay (samples).
+            delay              : Trailing zero samples enforcing a causal delay.
+            n_basis            : Raised-cosine basis functions.
+                                 0 (default) = raw tap parameterisation.
+                                 >0          = basis parameterisation; the kernel
+                                 is always B @ coeffs, guaranteeing smooth kernels.
+            log_offset         : Log-compression for the raised cosine basis
+                                 (default 1.0; larger → more linear spacing).
+            target_firing_rate : Target mean firing rate for ALM constraint.
+            rho                : ALM penalty parameter.
+        """
         super().__init__()
         self.N = n_channels
         self.T = n_temporal
+        self.D = delay
+        self.T_train = n_temporal - delay
+        assert self.T_train >= 1, "n_temporal must be greater than delay"
         self.X = n_spatial
         self.target_firing_rate = target_firing_rate
         self.rho = rho
 
-        # Use nn.Linear for spatial projection
+        # ------------------------------------------------------------------
+        # Temporal parameterisation
+        # ------------------------------------------------------------------
+        if n_basis > 0:
+            assert n_basis <= self.T_train, "n_basis must be <= n_temporal - delay"
+            self.n_basis = n_basis
+            basis = make_raised_cosine_basis(self.T_train, n_basis, log_offset)
+            self.register_buffer("basis", basis)          # (T_train, n_basis), fixed
+            self.temporal_coeffs = nn.Parameter(          # (N, n_basis), learned
+                torch.empty(self.N, n_basis)
+            )
+            nn.init.normal_(self.temporal_coeffs, mean=0.0, std=0.01)
+        else:
+            self.n_basis = 0
+            self.temporal_weight = nn.Parameter(          # (N, 1, T_train), learned
+                torch.empty(self.N, 1, self.T_train)
+            )
+            nn.init.normal_(self.temporal_weight, mean=0.0, std=0.01)
+            with torch.no_grad():
+                temp = self.temporal_weight.squeeze(1)
+                self.temporal_weight.copy_(
+                    (temp / (temp.norm(dim=1, keepdim=True) + 1e-8)).unsqueeze(1)
+                )
+
+        # ------------------------------------------------------------------
+        # Spatial projection
+        # ------------------------------------------------------------------
         self.spatial_projection = nn.Linear(self.X * self.X, self.N, bias=False)
-
-        # Use nn.Conv1d for temporal filtering (depthwise convolution)
-        self.temporal_conv = nn.Conv1d(
-            self.N, self.N, kernel_size=self.T, groups=self.N, bias=False
-        )
-
-        # Initialize with small random values and normalize
         nn.init.normal_(self.spatial_projection.weight, mean=0.0, std=0.01)
-        nn.init.normal_(self.temporal_conv.weight, mean=0.0, std=0.01)
-
-        # Normalize spatial and temporal weights to unit norm
         with torch.no_grad():
-            # Spatial: weight is (N, X*X), normalize along dim=1
             spatial_norm = self.spatial_projection.weight.norm(dim=1, keepdim=True)
             self.spatial_projection.weight.copy_(
-                self.spatial_projection.weight
-                / (spatial_norm + 1e-8)
+                self.spatial_projection.weight / (spatial_norm + 1e-8)
             )
-            # Temporal: weight is (N, 1, T), squeeze, normalize, unsqueeze
-            temp_weight = self.temporal_conv.weight.squeeze(1)  # (N, T)
-            temporal_norm = temp_weight.norm(dim=1, keepdim=True)
-            temp_weight = temp_weight / (temporal_norm + 1e-8)
-            self.temporal_conv.weight.copy_(temp_weight.unsqueeze(1))
 
         self.nonlinear = nn.Softplus(beta=2.5)
 
@@ -57,6 +90,28 @@ class RetinalEncoder(nn.Module):
             torch.zeros(self.N),
         )
 
+    def _trainable_taps(self) -> torch.Tensor:
+        """Return the (N, T_train) trainable portion of the kernel."""
+        if self.n_basis > 0:
+            # basis: (T_train, n_basis), coeffs: (N, n_basis) → (N, T_train)
+            return self.temporal_coeffs @ self.basis.T
+        else:
+            return self.temporal_weight.squeeze(1)  # (N, T_train)
+
+    def _full_kernel(self) -> torch.Tensor:
+        """Return the full (N, 1, T) kernel with trailing zeros for the delay.
+
+        F.conv1d uses cross-correlation (no kernel flip). The kernel index 0
+        corresponds to the oldest input sample in the receptive field. Appending
+        D zeros at the end therefore forces the output to ignore the D most
+        recent samples, implementing a causal delay of D steps.
+        """
+        taps = self._trainable_taps().unsqueeze(1)  # (N, 1, T_train)
+        if self.D == 0:
+            return taps
+        zeros = torch.zeros(self.N, 1, self.D, device=taps.device, dtype=taps.dtype)
+        return torch.cat([taps, zeros], dim=2)  # (N, 1, T)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (b, t, x, x)
@@ -69,8 +124,9 @@ class RetinalEncoder(nn.Module):
         # Transpose for temporal convolution: (batch, time, N) -> (batch, N, time)
         r = r.transpose(1, 2)
 
-        # Apply depthwise temporal convolution
-        r = self.temporal_conv(r)  # (batch, N, time - T + 1)
+        # Depthwise conv with the full (delay-prepended) kernel
+        kernel = self._full_kernel()  # (N, 1, T)
+        r = F.conv1d(r, kernel, groups=self.N)  # (batch, N, time - T + 1)
 
         # Apply gain and bias before nonlinearity
         # r: (batch, N, time_reduced), log_gain/log_bias: (N)
@@ -130,8 +186,8 @@ class RetinalEncoder(nn.Module):
 
     @property
     def temporal_weights(self) -> torch.Tensor:
-        """Get temporal weights squeezed to (N, T)."""
-        return self.temporal_conv.weight.squeeze(1)
+        """Get full temporal weights (N, T) including leading delay zeros."""
+        return self._full_kernel().squeeze(1).detach()
 
     @property
     def Lambda(self) -> torch.Tensor:
@@ -143,19 +199,23 @@ class RetinalEncoder(nn.Module):
     def normalize_kernels(self):
         """Normalize spatial and temporal kernels to unit L2 norm per channel."""
         with torch.no_grad():
-            # Normalize spatial projection weights: (N, X*X) -> normalize along dim=1
-            # Add epsilon to prevent division by zero
+            # Spatial
             spatial_norm = self.spatial_projection.weight.norm(dim=1, keepdim=True)
             self.spatial_projection.weight.copy_(
-                self.spatial_projection.weight
-                / (spatial_norm + 1e-8)
+                self.spatial_projection.weight / (spatial_norm + 1e-8)
             )
 
-            # Normalize temporal convolution weights: (N, 1, T) -> squeeze, normalize, unsqueeze
-            temp_weight = self.temporal_conv.weight.squeeze(1)  # (N, T)
-            temporal_norm = temp_weight.norm(dim=1, keepdim=True)
-            temp_weight = temp_weight / (temporal_norm + 1e-8)
-            self.temporal_conv.weight.copy_(temp_weight.unsqueeze(1))
+            # Temporal: normalize the projected kernel (delay zeros excluded)
+            taps = self._trainable_taps()          # (N, T_train)
+            tap_norm = taps.norm(dim=1, keepdim=True)  # (N, 1)
+            if self.n_basis > 0:
+                self.temporal_coeffs.copy_(
+                    self.temporal_coeffs / (tap_norm + 1e-8)
+                )
+            else:
+                self.temporal_weight.copy_(
+                    (taps / (tap_norm + 1e-8)).unsqueeze(1)
+                )
 
     def check_for_nans(self) -> dict[str, bool]:
         """

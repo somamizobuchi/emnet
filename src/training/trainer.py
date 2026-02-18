@@ -5,11 +5,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
+from pathlib import Path
 from tqdm import tqdm
 
 from ..models.model import EyeMovementNet
 from ..data.recon_dataset import ReconDataset
-from ..utils.reconstruction import stitch_frames_by_position, stitch_frames_by_position_bilinear
+from ..utils.reconstruction import (
+    stitch_frames_by_position,
+    stitch_frames_by_position_bilinear,
+)
 from ..utils import visualization as viz
 
 
@@ -30,6 +34,8 @@ class Trainer:
         l2_weight: float = 0.0,
         device: str = "cpu",
         log_dir: Optional[str] = None,
+        save_every: Optional[int] = None,
+        checkpoint_dir: Optional[str] = None,
     ):
         """
         Initialize trainer.
@@ -43,6 +49,8 @@ class Trainer:
             l2_weight: Weight for L2 regularization on V1/Frame weights (default: 0.0)
             device: Device to train on ("cpu" or "cuda")
             log_dir: Directory for tensorboard logs (default: None, no logging)
+            save_every: Save a checkpoint every this many iterations (default: None, no saving)
+            checkpoint_dir: Directory to save checkpoints (default: log_dir or "checkpoints")
         """
         self.model = model.to(device)
         self.dataset = dataset
@@ -63,13 +71,19 @@ class Trainer:
         # Optimizer with separate learning rates for gain/bias (more sensitive)
         param_groups = [
             {
-                "params": [p for n, p in model.named_parameters()
-                          if "log_gain" not in n and "log_bias" not in n],
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if "log_gain" not in n and "log_bias" not in n
+                ],
                 "lr": learning_rate,
             },
             {
-                "params": [p for n, p in model.named_parameters()
-                          if "log_gain" in n or "log_bias" in n],
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if "log_gain" in n or "log_bias" in n
+                ],
                 "lr": learning_rate * 0.1,  # 10x lower learning rate for gain/bias
             },
         ]
@@ -78,8 +92,27 @@ class Trainer:
         # Tensorboard logging
         self.writer = SummaryWriter(log_dir) if log_dir else None
 
+        # Checkpoint saving
+        self.save_every = save_every
+        if save_every is not None:
+            self.checkpoint_dir = Path(checkpoint_dir or log_dir or "checkpoints")
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
         # Training state
         self.iteration = 0
+
+    def save_checkpoint(self, path: Optional[str] = None):
+        """Save model and optimizer state to a checkpoint file."""
+        if path is None:
+            path = self.checkpoint_dir / f"checkpoint_{self.iteration:08d}.pt"
+        torch.save(
+            {
+                "iteration": self.iteration,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+            },
+            path,
+        )
 
     def _get_batch(self):
         """Get next batch, restarting iterator if needed."""
@@ -112,7 +145,11 @@ class Trainer:
         frames, target_img, eye_trace, mask = self._get_batch()
 
         # Check for NaN in input data
-        if torch.isnan(frames).any() or torch.isnan(target_img).any() or torch.isnan(eye_trace).any():
+        if (
+            torch.isnan(frames).any()
+            or torch.isnan(target_img).any()
+            or torch.isnan(eye_trace).any()
+        ):
             print(f"\n⚠️  NaN detected in input data at iteration {self.iteration}")
             print(f"   - frames has NaN: {torch.isnan(frames).any().item()}")
             print(f"   - target_img has NaN: {torch.isnan(target_img).any().item()}")
@@ -125,7 +162,9 @@ class Trainer:
         # Check for NaNs after forward pass
         if torch.isnan(reconstructed).any() or torch.isnan(rgc_output).any():
             print(f"\n⚠️  NaN detected after forward pass at iteration {self.iteration}")
-            print(f"   - reconstructed has NaN: {torch.isnan(reconstructed).any().item()}")
+            print(
+                f"   - reconstructed has NaN: {torch.isnan(reconstructed).any().item()}"
+            )
             print(f"   - rgc_output has NaN: {torch.isnan(rgc_output).any().item()}")
             print(f"   - Stopping training to prevent corruption")
             raise ValueError("NaN detected in forward pass")
@@ -144,7 +183,9 @@ class Trainer:
         for i in range(batch_size):
             # Move to CPU for stitching
             trace = eye_trace_aligned[i].float()
-            trace += torch.randn_like(trace) * 0.5  # Add noise (reduced std to 0.5 pixels)
+            trace += (
+                torch.randn_like(trace) * 0.5
+            )  # Add noise (reduced std to 0.5 pixels)
             eye_trace_cpu = trace.cpu()
             reconstructed_cpu = reconstructed[i].cpu()
 
@@ -158,9 +199,15 @@ class Trainer:
 
             # Check for NaN in stitched result
             if torch.isnan(stitched_cpu).any():
-                print(f"\n⚠️  NaN detected in stitching at iteration {self.iteration}, batch {i}")
-                print(f"   - eye_trace range: [{trace.min().item():.2f}, {trace.max().item():.2f}]")
-                print(f"   - reconstructed range: [{reconstructed_cpu.min().item():.2f}, {reconstructed_cpu.max().item():.2f}]")
+                print(
+                    f"\n⚠️  NaN detected in stitching at iteration {self.iteration}, batch {i}"
+                )
+                print(
+                    f"   - eye_trace range: [{trace.min().item():.2f}, {trace.max().item():.2f}]"
+                )
+                print(
+                    f"   - reconstructed range: [{reconstructed_cpu.min().item():.2f}, {reconstructed_cpu.max().item():.2f}]"
+                )
                 raise ValueError("NaN in stitching operation")
 
             # Move back to device for loss computation
@@ -199,7 +246,9 @@ class Trainer:
 
         # Check for NaN in losses
         if torch.isnan(total_loss):
-            print(f"\n⚠️  NaN detected in loss computation at iteration {self.iteration}")
+            print(
+                f"\n⚠️  NaN detected in loss computation at iteration {self.iteration}"
+            )
             print(f"   - recon_loss: {recon_loss.item()}")
             print(f"   - alm_loss: {alm_loss.item()}")
             print(f"   - kernel_var_loss: {kernel_var_loss.item()}")
@@ -212,7 +261,9 @@ class Trainer:
 
         # Gradient clipping to prevent explosion (BEFORE NaN check)
         # This clips gradients but doesn't fix NaN, so we still need to detect them
-        total_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=10.0
+        )
 
         # Check for NaN in gradients after clipping
         has_nan_grad = False
@@ -221,7 +272,9 @@ class Trainer:
                 print(f"\n⚠️  NaN detected in gradient at iteration {self.iteration}")
                 print(f"   - Parameter: {name}")
                 print(f"   - Total gradient norm before clip: {total_grad_norm.item()}")
-                print(f"   - Parameter value range: [{param.min().item():.4f}, {param.max().item():.4f}]")
+                print(
+                    f"   - Parameter value range: [{param.min().item():.4f}, {param.max().item():.4f}]"
+                )
                 has_nan_grad = True
                 break
 
@@ -230,7 +283,9 @@ class Trainer:
             print(f"   - Zeroing NaN gradients and continuing...")
             for param in self.model.parameters():
                 if param.grad is not None:
-                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    param.grad = torch.nan_to_num(
+                        param.grad, nan=0.0, posinf=0.0, neginf=0.0
+                    )
 
         self.optimizer.step()
 
@@ -244,7 +299,7 @@ class Trainer:
         self.model.update_lagrange_multiplier(constraint_violation)
 
         # Check for NaNs in model parameters (optional debugging)
-        if self.iteration % 100 == 0:
+        if self.iteration % 1000 == 0:
             nan_status = self.model.rgc_encoder.check_for_nans()
             if any(nan_status.values()):
                 print(f"\n⚠️  WARNING: NaN detected at iteration {self.iteration}:")
@@ -256,35 +311,40 @@ class Trainer:
 
         # Log to tensorboard
         if self.writer:
-            self.writer.add_scalar(
-                "loss/total", float(total_loss.item()), self.iteration
-            )
-            self.writer.add_scalar(
-                "loss/reconstruction", float(recon_loss.item()), self.iteration
-            )
-            self.writer.add_scalar("loss/alm", float(alm_loss.item()), self.iteration)
-            self.writer.add_scalar(
-                "loss/kernel_variance", float(kernel_var_loss.item()), self.iteration
-            )
-            self.writer.add_scalar(
-                "loss/l2_regularization", float(l2_loss.item()), self.iteration
-            )
-            self.writer.add_scalar(
-                "constraint/violation_mean",
-                float(constraint_violation.mean().item()),
-                self.iteration,
-            )
-            self.writer.add_scalar(
-                "constraint/violation_max",
-                float(constraint_violation.abs().max().item()),
-                self.iteration,
-            )
-            self.writer.add_scalar(
-                "train/grad_norm", float(total_grad_norm.item()), self.iteration
-            )
+            if self.iteration % 100 == 0:
+                self.writer.add_scalar(
+                    "loss/total", float(total_loss.item()), self.iteration
+                )
+                self.writer.add_scalar(
+                    "loss/reconstruction", float(recon_loss.item()), self.iteration
+                )
+                self.writer.add_scalar(
+                    "loss/alm", float(alm_loss.item()), self.iteration
+                )
+                self.writer.add_scalar(
+                    "loss/kernel_variance",
+                    float(kernel_var_loss.item()),
+                    self.iteration,
+                )
+                self.writer.add_scalar(
+                    "loss/l2_regularization", float(l2_loss.item()), self.iteration
+                )
+                self.writer.add_scalar(
+                    "constraint/violation_mean",
+                    float(constraint_violation.mean().item()),
+                    self.iteration,
+                )
+                self.writer.add_scalar(
+                    "constraint/violation_max",
+                    float(constraint_violation.abs().max().item()),
+                    self.iteration,
+                )
+                self.writer.add_scalar(
+                    "train/grad_norm", float(total_grad_norm.item()), self.iteration
+                )
 
             # Log kernels and parameters periodically
-            if self.iteration % 100 == 0:
+            if self.iteration % 1000 == 0:
                 spatial, temporal = self.model.get_rgc_weights()
 
                 # Spatial kernels grid
@@ -293,30 +353,39 @@ class Trainer:
                     "rgc/spatial_kernels", spatial_grid, self.iteration
                 )
 
-                # Temporal kernels plot
-                temporal_plot = viz.plot_temporal_kernels(temporal)
+                # Temporal kernels plot (full kernel including delay zeros)
+                temporal_plot = viz.plot_temporal_kernels(
+                    temporal,
+                    title="RGC Temporal Kernels",
+                    delay=self.model.rgc_encoder.D,
+                )
                 self.writer.add_image(
                     "rgc/temporal_kernels", temporal_plot, self.iteration
+                )
+
+                # V1 temporal kernels
+                v1_temporal = self.model.v1_decoder.temporal_weights
+                v1_temporal_plot = viz.plot_temporal_kernels(
+                    v1_temporal,
+                    title="V1 Temporal Kernels",
+                    delay=self.model.v1_decoder.D,
+                )
+                self.writer.add_image(
+                    "v1/temporal_kernels", v1_temporal_plot, self.iteration
                 )
 
                 # Histograms of parameters (only if valid)
                 log_gain = self.model.rgc_encoder.log_gain
                 if torch.isfinite(log_gain).all():
-                    self.writer.add_histogram(
-                        "rgc/log_gain", log_gain, self.iteration
-                    )
+                    self.writer.add_histogram("rgc/log_gain", log_gain, self.iteration)
 
                 log_bias = self.model.rgc_encoder.log_bias
                 if torch.isfinite(log_bias).all():
-                    self.writer.add_histogram(
-                        "rgc/log_bias", log_bias, self.iteration
-                    )
+                    self.writer.add_histogram("rgc/log_bias", log_bias, self.iteration)
 
                 lagrange = self.model.rgc_encoder.lagrange_multiplier
                 if torch.isfinite(lagrange).all():
-                    self.writer.add_histogram(
-                        "rgc/lambda", lagrange, self.iteration
-                    )
+                    self.writer.add_histogram("rgc/lambda", lagrange, self.iteration)
 
                 # Log images (normalized to [0, 1] for visualization)
                 if last_stitched is not None:
@@ -364,6 +433,10 @@ class Trainer:
         pbar = tqdm(range(max_iterations), desc="Training")
         for _ in pbar:
             metrics = self.train_step()
+
+            # Save checkpoint
+            if self.save_every and self.iteration % self.save_every == 0:
+                self.save_checkpoint()
 
             # Update progress bar with metrics
             pbar.set_postfix(

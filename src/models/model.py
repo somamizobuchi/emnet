@@ -29,6 +29,11 @@ class EyeMovementNet(nn.Module):
         rgc_temporal_length: int,
         v1_channels: int,
         v1_temporal_length: int,
+        rgc_delay: int = 0,
+        v1_delay: int = 0,
+        rgc_n_basis: int = 0,
+        v1_n_basis: int = 0,
+        log_offset: float = 1.0,
         target_firing_rate: float = 1.0,
         rho: float = 1.0,
     ):
@@ -39,9 +44,14 @@ class EyeMovementNet(nn.Module):
             img_size (int): Size of full image (img_size x img_size)
             roi_size (int): Size of region-of-interest patches (roi_size x roi_size)
             rgc_channels (int): Number of retinal ganglion cell channels
-            rgc_temporal_length (int): Temporal kernel length for RGC encoder
+            rgc_temporal_length (int): Total temporal kernel length for RGC encoder (delay + trainable)
             v1_channels (int): Number of V1 channels
-            v1_temporal_length (int): Temporal kernel length for V1 decoder
+            v1_temporal_length (int): Total temporal kernel length for V1 decoder (delay + trainable)
+            rgc_delay (int): Trailing zero samples in the RGC temporal kernel (default 0)
+            v1_delay (int): Trailing zero samples in the V1 temporal kernel (default 0)
+            rgc_n_basis (int): Raised-cosine basis for RGC (0 = raw taps, default 0)
+            v1_n_basis (int): Raised-cosine basis for V1 (0 = raw taps, default 0)
+            log_offset (float): Log-compression for raised cosine basis (default 1.0)
             target_firing_rate (float): Target firing rate for RGC constraint (default 1.0)
             rho (float): Penalty parameter for Augmented Lagrangian Method (default 1.0)
         """
@@ -62,6 +72,9 @@ class EyeMovementNet(nn.Module):
             n_channels=rgc_channels,
             n_spatial=roi_size,
             n_temporal=rgc_temporal_length,
+            delay=rgc_delay,
+            n_basis=rgc_n_basis,
+            log_offset=log_offset,
             target_firing_rate=target_firing_rate,
             rho=rho,
         )
@@ -70,6 +83,9 @@ class EyeMovementNet(nn.Module):
             in_channels=rgc_channels,
             out_channels=v1_channels,
             n_temporal=v1_temporal_length,
+            delay=v1_delay,
+            n_basis=v1_n_basis,
+            log_offset=log_offset,
         )
 
         self.frame_decoder = FrameDecoder(
@@ -166,6 +182,7 @@ class EyeMovementNet(nn.Module):
     def normalize_kernels(self) -> None:
         """Normalize all filters to unit L2 norm (energy constraint)."""
         self.rgc_encoder.normalize_kernels()
+        self.v1_decoder.normalize_kernels()
 
     def get_temporal_reduction(self) -> int:
         """

@@ -13,3 +13,5 @@ wheels/
 pearson-lab-reference-repo/
 
 runs/
+
+**/*.png
