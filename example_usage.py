@@ -55,9 +55,11 @@ def main():
 
     print(f"\nFiring Rate Constraint:")
     print(f"  ALM loss: {rgc_alm_loss.item():.6f}")
-    print(f"  Constraint violation: min={constraint_violation.min().item():.6f}, "
-          f"mean={constraint_violation.mean().item():.6f}, "
-          f"max={constraint_violation.max().item():.6f}")
+    print(
+        f"  Constraint violation: min={constraint_violation.min().item():.6f}, "
+        f"mean={constraint_violation.mean().item():.6f}, "
+        f"max={constraint_violation.max().item():.6f}"
+    )
 
     # Image reconstruction using first sample
     eye_trace = eye_trace[:, :, pad_start:]
@@ -69,18 +71,25 @@ def main():
 
     # Reconstruction loss
     recon_loss = (target_img[0] - reconstructed_img * mask[0]).square().sum()
+
+    # Compute L2 regularization loss
+    l2_loss = model.compute_l2_loss()
+
     total_loss = recon_loss + rgc_alm_loss
 
     print(f"Reconstruction loss: {recon_loss.item():.2f}")
+    print(f"L2 regularization loss: {l2_loss.item():.2f}")
     print(f"Total loss: {total_loss.item():.2f}")
 
     # Update constraints and normalize
     model.update_lagrange_multiplier(constraint_violation)
     model.normalize_kernels()
 
-    print(f"\nLagrange multipliers updated: min={model.Lambda.min().item():.6f}, "
-          f"mean={model.Lambda.mean().item():.6f}, "
-          f"max={model.Lambda.max().item():.6f}")
+    print(
+        f"\nLagrange multipliers updated: min={model.Lambda.min().item():.6f}, "
+        f"mean={model.Lambda.mean().item():.6f}, "
+        f"max={model.Lambda.max().item():.6f}"
+    )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from models.frame_decoder import FrameDecoder
 from data.recon_dataset import ReconDataset
 from utils.reconstruction import stitch_frames_by_position
 
+
 def main():
     img_size = 128
     roi_w = 10
@@ -30,7 +31,9 @@ def main():
 
     # Initialize RGC encoder with firing rate constraint
     rgc_encoder = RetinalEncoder(
-        rgc_n, roi_w, rgc_l,
+        rgc_n,
+        roi_w,
+        rgc_l,
         target_firing_rate=target_firing_rate,
         rho=rho,
     )
@@ -46,7 +49,9 @@ def main():
     print(f"RGC output: {y_rgc.shape}")
 
     # Compute RGC firing rate constraint loss
-    rgc_alm_loss, rgc_constraint_violation = rgc_encoder.compute_firing_rate_constraint(y_rgc)
+    rgc_alm_loss, rgc_constraint_violation = rgc_encoder.compute_firing_rate_constraint(
+        y_rgc
+    )
 
     y_v1 = v1_decoder(y_rgc)
     print(f"V1 output: {y_v1.shape}")
@@ -55,7 +60,7 @@ def main():
     print(f"frame decoder output: {y.shape}")
 
     # Eye trace alignment
-    eye_trace = eye_trace[:,:,pad_start:]
+    eye_trace = eye_trace[:, :, pad_start:]
     print(f"eye_trace: {eye_trace.shape}")
 
     # Image reconstruction (first batch item)
@@ -66,30 +71,46 @@ def main():
     recon_loss = (target_img[0] - reconstructed * mask[0]).square().sum()
     print(f"reconstruction loss: {recon_loss}")
 
+    # L2 regularization loss
+    l2_loss = (
+        rgc_encoder.spatial_projection.weight.square().sum()
+        + v1_decoder.spatial_projection.weight.square().sum()
+        + frame_decoder.decoder.weight.square().sum()
+    )
+    print(f"L2 regularization loss: {l2_loss}")
+
     # Total loss
-    total_loss = recon_loss + rgc_alm_loss
+    total_loss = recon_loss + rgc_alm_loss + l2_loss
     print(f"\nRGC Firing Rate Constraint:")
     print(f"  target firing rate: {target_firing_rate}")
-    print(f"  actual firing rate (per channel): min={rgc_constraint_violation.min().item() + target_firing_rate:.6f}, "
-          f"mean={rgc_constraint_violation.mean().item() + target_firing_rate:.6f}, "
-          f"max={rgc_constraint_violation.max().item() + target_firing_rate:.6f}")
-    print(f"  constraint violation (per channel): min={rgc_constraint_violation.min().item():.6f}, "
-          f"mean={rgc_constraint_violation.mean().item():.6f}, "
-          f"max={rgc_constraint_violation.max().item():.6f}")
-    print(f"  Lagrange multiplier: min={rgc_encoder.Lambda.min().item():.6f}, "
-          f"mean={rgc_encoder.Lambda.mean().item():.6f}, "
-          f"max={rgc_encoder.Lambda.max().item():.6f}")
+    print(
+        f"  actual firing rate (per channel): min={rgc_constraint_violation.min().item() + target_firing_rate:.6f}, "
+        f"mean={rgc_constraint_violation.mean().item() + target_firing_rate:.6f}, "
+        f"max={rgc_constraint_violation.max().item() + target_firing_rate:.6f}"
+    )
+    print(
+        f"  constraint violation (per channel): min={rgc_constraint_violation.min().item():.6f}, "
+        f"mean={rgc_constraint_violation.mean().item():.6f}, "
+        f"max={rgc_constraint_violation.max().item():.6f}"
+    )
+    print(
+        f"  Lagrange multiplier: min={rgc_encoder.Lambda.min().item():.6f}, "
+        f"mean={rgc_encoder.Lambda.mean().item():.6f}, "
+        f"max={rgc_encoder.Lambda.max().item():.6f}"
+    )
     print(f"  ALM loss: {rgc_alm_loss.item():.6f}")
     print(f"  total loss: {total_loss.item():.6f}")
 
     # Update Lagrange multipliers (dual-ascent step for ALM)
     rgc_encoder.update_lagrange_multiplier(rgc_constraint_violation)
-    print(f"\nUpdated Lagrange multiplier: min={rgc_encoder.Lambda.min().item():.6f}, "
-          f"mean={rgc_encoder.Lambda.mean().item():.6f}, "
-          f"max={rgc_encoder.Lambda.max().item():.6f}")
+    print(
+        f"\nUpdated Lagrange multiplier: min={rgc_encoder.Lambda.min().item():.6f}, "
+        f"mean={rgc_encoder.Lambda.mean().item():.6f}, "
+        f"max={rgc_encoder.Lambda.max().item():.6f}"
+    )
 
     # Unit-norm kernels
-    rgc_encoder.normalize_kenels()
+    rgc_encoder.normalize_kernels()
 
 
 if __name__ == "__main__":

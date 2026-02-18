@@ -134,6 +134,26 @@ class EyeMovementNet(nn.Module):
         """
         return self.rgc_encoder.compute_firing_rate_constraint(rgc_output)
 
+    def compute_spatial_variance_loss(self) -> torch.Tensor:
+        """
+        Compute the spatial variance (localization) loss for the RGC encoder kernels.
+
+        Returns:
+            torch.Tensor: Mean spatial variance (scalar)
+        """
+        return self.rgc_encoder.compute_spatial_variance()
+
+    def compute_l2_loss(self) -> torch.Tensor:
+        """
+        Compute L2 regularization loss for V1 spatial and frame decoder weights.
+
+        Returns:
+            torch.Tensor: Mean of squared weights (scalar)
+        """
+        v1_l2 = (self.v1_decoder.spatial_projection.weight**2).mean()
+        frame_l2 = (self.frame_decoder.decoder.weight**2).mean()
+        return v1_l2 + frame_l2
+
     def update_lagrange_multiplier(self, constraint_violation: torch.Tensor) -> None:
         """
         Update Lagrange multipliers for firing rate constraint (dual-ascent step).
@@ -145,7 +165,7 @@ class EyeMovementNet(nn.Module):
 
     def normalize_kernels(self) -> None:
         """Normalize all filters to unit L2 norm (energy constraint)."""
-        self.rgc_encoder.normalize_kenels()
+        self.rgc_encoder.normalize_kernels()
 
     def get_temporal_reduction(self) -> int:
         """
@@ -159,7 +179,20 @@ class EyeMovementNet(nn.Module):
     @property
     def Lambda(self) -> torch.Tensor:
         """Access Lagrange multipliers for firing rate constraint."""
-        return self.rgc_encoder.Lambda
+        val = self.rgc_encoder.lagrange_multiplier
+        assert isinstance(val, torch.Tensor)
+        return val
+
+    def get_rgc_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get spatial and temporal weights from the RGC encoder.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - spatial_weights: (N, X, X)
+                - temporal_weights: (N, T)
+        """
+        return self.rgc_encoder.spatial_weights, self.rgc_encoder.temporal_weights
 
     def extra_repr(self) -> str:
         """Extra representation for printing the model."""

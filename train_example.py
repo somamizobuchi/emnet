@@ -1,6 +1,7 @@
 """Example training script for EyeMovementNet."""
 
 import torch
+from datetime import datetime
 from src.models.model import EyeMovementNet
 from src.data.recon_dataset import ReconDataset
 from src.training.trainer import Trainer
@@ -8,14 +9,14 @@ from src.training.trainer import Trainer
 
 def main():
     # Model hyperparameters
-    img_size = 128
-    roi_size = 24
+    img_size = 64
+    roi_size = 20
     fix_length = 128
 
     rgc_channels = 100
     rgc_temporal_length = 16
 
-    v1_channels = 512
+    v1_channels = 400
     v1_temporal_length = 16
 
     # Dataset parameters
@@ -25,8 +26,10 @@ def main():
     pad_start = (rgc_temporal_length - 1) + (v1_temporal_length - 1)
 
     # Constraint parameters
-    target_firing_rate = 1.0
-    rho = 1.0
+    target_firing_rate = 1
+    rho = 0
+    centering_weight = 1e-3
+    l2_weight = 1e-1
 
     # Create dataset
     print("Creating dataset...")
@@ -64,19 +67,25 @@ def main():
     else:
         device = "cpu"
 
+    # Create timestamped log directory
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = f"runs/training/{timestamp}"
+
     trainer = Trainer(
         model=model,
         dataset=dataset,
         batch_size=8,
         learning_rate=1e-3,
+        centering_weight=centering_weight,
+        l2_weight=l2_weight,
         device=device,
-        log_dir="runs/training",
+        log_dir=log_dir,
     )
 
     # Train
-    print("\n" + "="*80)
-    trainer.train(max_iterations=1000)
-    print("="*80)
+    print("\n" + "=" * 80)
+    trainer.train(max_iterations=1_000_000)
+    print("=" * 80)
 
 
 if __name__ == "__main__":

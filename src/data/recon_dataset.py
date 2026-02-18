@@ -38,7 +38,10 @@ class ReconDataset(Dataset):
 
         imgs = []
         for _ in tqdm(range(500), desc="Generating images"):
-            imgs.append(pink_noise_gray_image(img_size))
+            img = pink_noise_gray_image(img_size)
+            # Scale to unit standard deviation
+            img = img / (img.std() + 1e-8)
+            imgs.append(img)
         self.imgs = np.stack(imgs, axis=0).astype(np.float32)
 
     def __len__(self) -> int:
@@ -85,17 +88,19 @@ class ReconDataset(Dataset):
 
         if self.average:
             w = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+        else:
+            w = None
 
         mask = np.full((self.img_size, self.img_size), False)
         for i in range(self.total_samples):
             x, y = eye_trace[:, i]
             video_frames[i] = img[y : y + self.roi_size, x : x + self.roi_size]
             if i >= sacc_end_idx and i >= self.pad_start:
-                if self.average:
+                if self.average and w is not None:
                     w[y : y + self.roi_size, x : x + self.roi_size] += video_frames[i]
                 mask[y : y + self.roi_size, x : x + self.roi_size] = True
 
-        if self.average:
+        if self.average and w is not None:
             img = w / (self.total_samples - self.pad_start)
 
         return (
@@ -136,12 +141,13 @@ class ReconDataset(Dataset):
                 0, self.img_size - self.roi_size, size=(2, 1)
             )  # Random end point
             # Generate saccades
-            amp = np.linalg.norm(end_point - d1[:, -1]) / self.pixels_per_degree
-            theta = np.atan2(
-                end_point[1] - d1[1, -1], end_point[0] - d1[0, -1]
-            )  # Angle in radians
-            theta = np.rad2deg(theta)
-            _, sx, sy, _ = generate_saccade(amp, theta, self.sampling_frequency)
+            amp_val: float = float(
+                np.linalg.norm(end_point - d1[:, -1]) / self.pixels_per_degree
+            )
+            theta_val: float = float(
+                np.rad2deg(np.atan2(end_point[1] - d1[1, -1], end_point[0] - d1[0, -1]))
+            )  # Angle in degrees
+            _, sx, sy, _ = generate_saccade(amp_val, theta_val, self.sampling_frequency)
             s = np.vstack((sx, sy))
             s = np.round(s * self.pixels_per_degree).astype(int) + d1[:, -1:]
             if np.all(s >= 0) and np.all(s < self.img_size - self.roi_size):
@@ -161,4 +167,3 @@ class ReconDataset(Dataset):
 
         # Combine drift and saccade
         return (np.concatenate((d1, s, d2), axis=1), sacc_end_idx)
-

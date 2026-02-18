@@ -3,10 +3,13 @@
 import torch
 
 
+from typing import Optional
+
+
 def compute_firing_rate_constraint(
     firing_rate: torch.Tensor,
     target_firing_rate: float = 1.0,
-    lagrange_multiplier: torch.Tensor = None,
+    lagrange_multiplier: Optional[torch.Tensor] = None,
     rho: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -30,10 +33,12 @@ def compute_firing_rate_constraint(
             - constraint_violation: h = mean(firing_rate) - target, shape (n_channels,)
     """
     # Compute constraint violation: h_i = mean(r_i) - target
-    constraint_violation = firing_rate.mean(dim=tuple(range(firing_rate.ndim - 1))) - target_firing_rate
+    constraint_violation = (
+        firing_rate.mean(dim=tuple(range(firing_rate.ndim - 1))) - target_firing_rate
+    )
 
     # Quadratic penalty term: (ρ/2) · ||h||²
-    quadratic_penalty = rho / 2.0 * (constraint_violation ** 2).sum()
+    quadratic_penalty = rho / 2.0 * (constraint_violation**2).sum()
 
     # Linear penalty term: λᵀ · h (if Lagrange multiplier provided)
     if lagrange_multiplier is not None:
