@@ -15,13 +15,11 @@ def main():
 
     rgc_channels = 100
     rgc_temporal_length = 16
-    rgc_delay = 0  # trailing zero samples in RGC temporal kernel
-    rgc_n_basis = 6  # raised-cosine basis functions (0 = raw taps)
+    rgc_delay = 1  # trailing zero samples in RGC temporal kernel
 
     v1_channels = 400
     v1_temporal_length = 16
-    v1_delay = 0  # trailing zero samples in V1 temporal kernel
-    v1_n_basis = 6  # raised-cosine basis functions (0 = raw taps)
+    v1_delay = 1  # trailing zero samples in V1 temporal kernel
 
     # Dataset parameters
     diffusion_coefficient = 20.0 / 3600.0
@@ -32,8 +30,9 @@ def main():
     # Constraint parameters
     target_firing_rate = 1
     rho = 0
-    centering_weight = 1e-3
-    l2_weight = 1e-1
+
+    # GradNorm parameters
+    grad_norm_alpha = 2
 
     # Create dataset
     print("Creating dataset...")
@@ -58,8 +57,6 @@ def main():
         v1_temporal_length=v1_temporal_length,
         rgc_delay=rgc_delay,
         v1_delay=v1_delay,
-        rgc_n_basis=rgc_n_basis,
-        v1_n_basis=v1_n_basis,
         target_firing_rate=target_firing_rate,
         rho=rho,
     )
@@ -84,8 +81,7 @@ def main():
         dataset=dataset,
         batch_size=8,
         learning_rate=1e-3,
-        centering_weight=centering_weight,
-        l2_weight=l2_weight,
+        grad_norm_alpha=grad_norm_alpha,
         device=device,
         log_dir=log_dir,
         save_every=10_000,

@@ -1,4 +1,4 @@
-"""Simple iteration-based trainer for EyeMovementNet."""
+"""Simple iteration-based trainer for EyeMovementNet with GradNorm."""
 
 import torch
 import torch.nn as nn
@@ -17,11 +17,17 @@ from ..utils.reconstruction import (
 from ..utils import visualization as viz
 
 
+# Auxiliary loss component names balanced by GradNorm (order matches log_weights indices)
+AUX_TASK_NAMES = ["kernel_var", "regularization", "temporal_smoothness"]
+
+
 class Trainer:
     """
     Simple iteration-based trainer for EyeMovementNet.
 
-    No epoch management - just iterates for a fixed number of steps.
+    Uses GradNorm (Chen et al., 2018) to dynamically balance loss weights
+    based on gradient magnitudes. ALM (firing rate constraint) is kept
+    separate with fixed weight since it has its own Lagrange multiplier dynamics.
     """
 
     def __init__(
@@ -30,34 +36,17 @@ class Trainer:
         dataset: ReconDataset,
         batch_size: int = 8,
         learning_rate: float = 1e-3,
-        centering_weight: float = 0.0,
-        l2_weight: float = 0.0,
+        grad_norm_alpha: float = 1.5,
         device: str = "cpu",
         log_dir: Optional[str] = None,
         save_every: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
     ):
-        """
-        Initialize trainer.
-
-        Args:
-            model: EyeMovementNet model to train
-            dataset: ReconDataset for training
-            batch_size: Batch size for data loading
-            learning_rate: Learning rate for optimizer
-            centering_weight: Weight for kernel spatial variance loss (default: 0.0)
-            l2_weight: Weight for L2 regularization on V1/Frame weights (default: 0.0)
-            device: Device to train on ("cpu" or "cuda")
-            log_dir: Directory for tensorboard logs (default: None, no logging)
-            save_every: Save a checkpoint every this many iterations (default: None, no saving)
-            checkpoint_dir: Directory to save checkpoints (default: log_dir or "checkpoints")
-        """
         self.model = model.to(device)
         self.dataset = dataset
         self.batch_size = batch_size
-        self.centering_weight = centering_weight
-        self.l2_weight = l2_weight
         self.device = device
+        self.grad_norm_alpha = grad_norm_alpha
 
         # Data loader
         self.dataloader = DataLoader(
@@ -67,6 +56,9 @@ class Trainer:
             drop_last=True,
         )
         self.data_iter = iter(self.dataloader)
+
+        # GradNorm: learnable log-weights for 4 loss components
+        self.log_weights = nn.Parameter(torch.zeros(len(AUX_TASK_NAMES), device=device))
 
         # Optimizer with separate learning rates for gain/bias (more sensitive)
         param_groups = [
@@ -84,10 +76,19 @@ class Trainer:
                     for n, p in model.named_parameters()
                     if "log_gain" in n or "log_bias" in n
                 ],
-                "lr": learning_rate * 0.1,  # 10x lower learning rate for gain/bias
+                "lr": learning_rate * 0.1,
             },
         ]
         self.optimizer = torch.optim.Adam(param_groups)
+
+        # Separate optimizer for GradNorm weights
+        self.weight_optimizer = torch.optim.Adam([self.log_weights], lr=0.025)
+
+        # Initial loss values for relative training rate (set after first iteration)
+        self.initial_losses: Optional[torch.Tensor] = None
+
+        # Shared layer for GradNorm gradient computation
+        self.shared_layer = self.model.frame_decoder.decoder.weight
 
         # Tensorboard logging
         self.writer = SummaryWriter(log_dir) if log_dir else None
@@ -110,6 +111,9 @@ class Trainer:
                 "iteration": self.iteration,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "log_weights": self.log_weights.data,
+                "weight_optimizer_state_dict": self.weight_optimizer.state_dict(),
+                "initial_losses": self.initial_losses,
             },
             path,
         )
@@ -122,7 +126,6 @@ class Trainer:
             self.data_iter = iter(self.dataloader)
             batch = next(self.data_iter)
 
-        # Move to device
         frames, target_img, eye_trace, mask, _ = batch
         frames = frames.to(self.device)
         target_img = target_img.to(self.device)
@@ -131,95 +134,58 @@ class Trainer:
 
         return frames, target_img, eye_trace, mask
 
-    def train_step(self) -> dict:
-        """
-        Execute one training iteration.
+    def _compute_grad_norms(self, losses: list[torch.Tensor]) -> torch.Tensor:
+        """Compute gradient norms of each weighted loss w.r.t. all model parameters."""
+        weights = torch.exp(self.log_weights)
+        shared_params = [p for p in self.model.parameters() if p.requires_grad]
+        norms = []
+        for i, loss in enumerate(losses):
+            weighted = weights[i] * loss
+            grads = torch.autograd.grad(
+                weighted, shared_params,
+                retain_graph=True, create_graph=True, allow_unused=True,
+            )
+            total_norm = sum(
+                (g.norm() ** 2 for g in grads if g is not None),
+                torch.zeros(1, device=self.device),
+            )
+            norms.append(total_norm.sqrt())
+        return torch.stack(norms)
 
-        Returns:
-            dict: Loss values and metrics for this step
-        """
+    def train_step(self) -> dict:
+        """Execute one training iteration."""
         self.model.train()
         self.optimizer.zero_grad()
+        self.weight_optimizer.zero_grad()
 
         # Get batch
         frames, target_img, eye_trace, mask = self._get_batch()
 
-        # Check for NaN in input data
-        if (
-            torch.isnan(frames).any()
-            or torch.isnan(target_img).any()
-            or torch.isnan(eye_trace).any()
-        ):
-            print(f"\n⚠️  NaN detected in input data at iteration {self.iteration}")
-            print(f"   - frames has NaN: {torch.isnan(frames).any().item()}")
-            print(f"   - target_img has NaN: {torch.isnan(target_img).any().item()}")
-            print(f"   - eye_trace has NaN: {torch.isnan(eye_trace).any().item()}")
-            raise ValueError("NaN in input data from dataset")
-
         # Forward pass
         reconstructed, rgc_output, _ = self.model(frames, return_intermediates=True)
 
-        # Check for NaNs after forward pass
-        if torch.isnan(reconstructed).any() or torch.isnan(rgc_output).any():
-            print(f"\n⚠️  NaN detected after forward pass at iteration {self.iteration}")
-            print(
-                f"   - reconstructed has NaN: {torch.isnan(reconstructed).any().item()}"
-            )
-            print(f"   - rgc_output has NaN: {torch.isnan(rgc_output).any().item()}")
-            print(f"   - Stopping training to prevent corruption")
-            raise ValueError("NaN detected in forward pass")
-
-        # Reshape reconstructed frames: (batch, time, roi_size, roi_size)
-        batch_size = reconstructed.shape[0]
-
         # Align eye trace with temporal reduction
+        batch_size = reconstructed.shape[0]
         pad_start = self.model.get_temporal_reduction()
         eye_trace_aligned = eye_trace[:, :, pad_start:]
 
-        # Compute reconstruction loss (SSE over batch and pixels)
-        # Note: stitching is done on CPU as it uses integer indexing which is slow on MPS/CUDA
+        # Compute reconstruction loss
         batch_sse = []
         last_stitched = None
         for i in range(batch_size):
-            # Move to CPU for stitching
             trace = eye_trace_aligned[i].float()
-            trace += (
-                torch.randn_like(trace) * 0.5
-            )  # Add noise (reduced std to 0.5 pixels)
+            trace += torch.randn_like(trace) * 0.5
             eye_trace_cpu = trace.cpu()
             reconstructed_cpu = reconstructed[i].cpu()
 
-            # Stitch on CPU
-            # stitched_cpu = stitch_frames_by_position(
-            #     eye_trace_cpu, reconstructed_cpu, self.model.img_size
-            # )
             stitched_cpu = stitch_frames_by_position_bilinear(
                 eye_trace_cpu, reconstructed_cpu, self.model.img_size
             )
 
-            # Check for NaN in stitched result
-            if torch.isnan(stitched_cpu).any():
-                print(
-                    f"\n⚠️  NaN detected in stitching at iteration {self.iteration}, batch {i}"
-                )
-                print(
-                    f"   - eye_trace range: [{trace.min().item():.2f}, {trace.max().item():.2f}]"
-                )
-                print(
-                    f"   - reconstructed range: [{reconstructed_cpu.min().item():.2f}, {reconstructed_cpu.max().item():.2f}]"
-                )
-                raise ValueError("NaN in stitching operation")
-
-            # Move back to device for loss computation
             stitched = stitched_cpu.to(self.device)
-
-            # Compute sum of squared errors for this sample (only on masked region)
-            # Compute error only where mask is positive (visited regions)
             error = (target_img[i] - stitched) ** 2
             sse = (error * mask[i]).sum()
-
-            # Normalize by number of pixels to get mean squared error
-            num_pixels = mask[i].sum() + 1e-8  # Add epsilon to prevent division by zero
+            num_pixels = mask[i].sum() + 1e-8
             mse = sse / num_pixels
 
             batch_sse.append(mse)
@@ -227,89 +193,65 @@ class Trainer:
 
         recon_loss = torch.stack(batch_sse).mean()
 
-        # Compute firing rate constraint loss
+        # Compute other loss components
         alm_loss, constraint_violation = self.model.compute_firing_rate_loss(rgc_output)
-
-        # Compute kernel spatial variance loss
         kernel_var_loss = self.model.compute_spatial_variance_loss()
+        reg_loss = self.model.compute_regularization_loss()
+        temporal_smoothness_loss = self.model.compute_temporal_smoothness_loss()
 
-        # Compute L2 regularization loss
-        l2_loss = self.model.compute_l2_loss()
+        # Auxiliary losses balanced by GradNorm (order matches AUX_TASK_NAMES)
+        aux_losses = [kernel_var_loss, reg_loss, temporal_smoothness_loss]
 
-        # Total loss
-        total_loss = (
-            recon_loss
-            + alm_loss
-            + self.centering_weight * kernel_var_loss
-            + self.l2_weight * l2_loss
-        )
-
-        # Check for NaN in losses
-        if torch.isnan(total_loss):
-            print(
-                f"\n⚠️  NaN detected in loss computation at iteration {self.iteration}"
+        # Store initial losses for relative training rate
+        if self.initial_losses is None:
+            self.initial_losses = torch.tensor(
+                [l.detach().item() for l in aux_losses], device=self.device
             )
-            print(f"   - recon_loss: {recon_loss.item()}")
-            print(f"   - alm_loss: {alm_loss.item()}")
-            print(f"   - kernel_var_loss: {kernel_var_loss.item()}")
-            print(f"   - l2_loss: {l2_loss.item()}")
-            print(f"   - constraint_violation: {constraint_violation}")
-            raise ValueError("NaN detected in loss")
+            self.initial_losses = torch.clamp(self.initial_losses, min=1e-8)
 
-        # Backward pass
-        total_loss.backward()
+        # GradNorm: compute gradient norms and update weights for aux tasks
+        grad_norms = self._compute_grad_norms(aux_losses)
 
-        # Gradient clipping to prevent explosion (BEFORE NaN check)
-        # This clips gradients but doesn't fix NaN, so we still need to detect them
-        total_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=10.0
+        # Relative inverse training rates
+        with torch.no_grad():
+            current_losses = torch.tensor(
+                [l.item() for l in aux_losses], device=self.device
+            )
+            relative_rates = current_losses / self.initial_losses
+            relative_rates = relative_rates / relative_rates.mean()
+
+        # GradNorm targets
+        target_norms = grad_norms.detach().mean() * (
+            relative_rates ** self.grad_norm_alpha
         )
 
-        # Check for NaN in gradients after clipping
-        has_nan_grad = False
-        for name, param in self.model.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                print(f"\n⚠️  NaN detected in gradient at iteration {self.iteration}")
-                print(f"   - Parameter: {name}")
-                print(f"   - Total gradient norm before clip: {total_grad_norm.item()}")
-                print(
-                    f"   - Parameter value range: [{param.min().item():.4f}, {param.max().item():.4f}]"
-                )
-                has_nan_grad = True
-                break
+        # GradNorm loss
+        grad_norm_loss = (grad_norms - target_norms).abs().sum()
 
-        if has_nan_grad:
-            # Zero out NaN gradients and continue (emergency recovery)
-            print(f"   - Zeroing NaN gradients and continuing...")
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad = torch.nan_to_num(
-                        param.grad, nan=0.0, posinf=0.0, neginf=0.0
-                    )
+        # Update weight optimizer
+        grad_norm_loss.backward(retain_graph=True)
+        self.weight_optimizer.step()
 
-        self.optimizer.step()
-
-        # Clamp log_gain and log_bias to prevent runaway (after optimizer step)
+        # Renormalize log_weights to keep product = 1
         with torch.no_grad():
-            self.model.rgc_encoder.log_gain.clamp_(-10.0, 10.0)
-            self.model.rgc_encoder.log_bias.clamp_(-10.0, 10.0)
+            self.log_weights.data -= self.log_weights.data.mean()
+
+        # Total loss: fixed recon + GradNorm-weighted aux + ALM
+        aux_weights = torch.exp(self.log_weights.detach())
+        total_loss = recon_loss + sum(w * l for w, l in zip(aux_weights, aux_losses)) + alm_loss
+
+        # Backward and step main optimizer
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
 
         # Apply constraints
         self.model.normalize_kernels()
         self.model.update_lagrange_multiplier(constraint_violation)
 
-        # Check for NaNs in model parameters (optional debugging)
-        if self.iteration % 1000 == 0:
-            nan_status = self.model.rgc_encoder.check_for_nans()
-            if any(nan_status.values()):
-                print(f"\n⚠️  WARNING: NaN detected at iteration {self.iteration}:")
-                for param_name, has_nan in nan_status.items():
-                    if has_nan:
-                        print(f"  - {param_name}")
-
         self.iteration += 1
 
-        # Log to tensorboard
+        # Tensorboard logging
         if self.writer:
             if self.iteration % 100 == 0:
                 self.writer.add_scalar(
@@ -327,7 +269,15 @@ class Trainer:
                     self.iteration,
                 )
                 self.writer.add_scalar(
-                    "loss/l2_regularization", float(l2_loss.item()), self.iteration
+                    "loss/regularization", float(reg_loss.item()), self.iteration
+                )
+                self.writer.add_scalar(
+                    "loss/temporal_smoothness",
+                    float(temporal_smoothness_loss.item()),
+                    self.iteration,
+                )
+                self.writer.add_scalar(
+                    "loss/grad_norm", float(grad_norm_loss.item()), self.iteration
                 )
                 self.writer.add_scalar(
                     "constraint/violation_mean",
@@ -339,21 +289,25 @@ class Trainer:
                     float(constraint_violation.abs().max().item()),
                     self.iteration,
                 )
-                self.writer.add_scalar(
-                    "train/grad_norm", float(total_grad_norm.item()), self.iteration
-                )
+
+                # Log GradNorm weights
+                effective_weights = torch.exp(self.log_weights.detach())
+                for j, name in enumerate(AUX_TASK_NAMES):
+                    self.writer.add_scalar(
+                        f"gradnorm/weight_{name}",
+                        float(effective_weights[j].item()),
+                        self.iteration,
+                    )
 
             # Log kernels and parameters periodically
             if self.iteration % 1000 == 0:
                 spatial, temporal = self.model.get_rgc_weights()
 
-                # Spatial kernels grid
                 spatial_grid = viz.plot_spatial_kernels(spatial, self.model.roi_size)
                 self.writer.add_image(
                     "rgc/spatial_kernels", spatial_grid, self.iteration
                 )
 
-                # Temporal kernels plot (full kernel including delay zeros)
                 temporal_plot = viz.plot_temporal_kernels(
                     temporal,
                     title="RGC Temporal Kernels",
@@ -363,7 +317,6 @@ class Trainer:
                     "rgc/temporal_kernels", temporal_plot, self.iteration
                 )
 
-                # V1 temporal kernels
                 v1_temporal = self.model.v1_decoder.temporal_weights
                 v1_temporal_plot = viz.plot_temporal_kernels(
                     v1_temporal,
@@ -374,20 +327,24 @@ class Trainer:
                     "v1/temporal_kernels", v1_temporal_plot, self.iteration
                 )
 
-                # Histograms of parameters (only if valid)
                 log_gain = self.model.rgc_encoder.log_gain
                 if torch.isfinite(log_gain).all():
-                    self.writer.add_histogram("rgc/log_gain", log_gain, self.iteration)
+                    self.writer.add_histogram(
+                        "rgc/log_gain", log_gain, self.iteration
+                    )
 
                 log_bias = self.model.rgc_encoder.log_bias
                 if torch.isfinite(log_bias).all():
-                    self.writer.add_histogram("rgc/log_bias", log_bias, self.iteration)
+                    self.writer.add_histogram(
+                        "rgc/log_bias", log_bias, self.iteration
+                    )
 
                 lagrange = self.model.rgc_encoder.lagrange_multiplier
                 if torch.isfinite(lagrange).all():
-                    self.writer.add_histogram("rgc/lambda", lagrange, self.iteration)
+                    self.writer.add_histogram(
+                        "rgc/lambda", lagrange, self.iteration
+                    )
 
-                # Log images (normalized to [0, 1] for visualization)
                 if last_stitched is not None:
 
                     def norm_img(img):
@@ -407,27 +364,30 @@ class Trainer:
                     )
 
         # Return metrics
+        effective_weights = torch.exp(self.log_weights.detach())
         return {
             "iteration": self.iteration,
             "total_loss": float(total_loss.item()),
             "recon_loss": float(recon_loss.item()),
             "alm_loss": float(alm_loss.item()),
             "kernel_var_loss": float(kernel_var_loss.item()),
-            "l2_loss": float(l2_loss.item()),
+            "reg_loss": float(reg_loss.item()),
+            "temporal_smoothness_loss": float(temporal_smoothness_loss.item()),
+            "grad_norm_loss": float(grad_norm_loss.item()),
             "constraint_violation_mean": float(constraint_violation.mean().item()),
             "constraint_violation_max": float(constraint_violation.abs().max().item()),
+            "weights": {
+                name: float(effective_weights[j].item())
+                for j, name in enumerate(AUX_TASK_NAMES)
+            },
         }
 
     def train(self, max_iterations: int):
-        """
-        Train for a fixed number of iterations.
-
-        Args:
-            max_iterations: Maximum number of training iterations
-        """
+        """Train for a fixed number of iterations."""
         print(f"Starting training for {max_iterations} iterations...")
         print(f"Device: {self.device}")
         print(f"Batch size: {self.batch_size}")
+        print(f"GradNorm alpha: {self.grad_norm_alpha}")
         print()
 
         pbar = tqdm(range(max_iterations), desc="Training")
@@ -438,14 +398,13 @@ class Trainer:
             if self.save_every and self.iteration % self.save_every == 0:
                 self.save_checkpoint()
 
-            # Update progress bar with metrics
+            # Update progress bar
             pbar.set_postfix(
                 {
                     "total": f"{metrics['total_loss']:.2f}",
                     "recon": f"{metrics['recon_loss']:.2f}",
                     "alm": f"{metrics['alm_loss']:.2f}",
-                    "kvar": f"{metrics['kernel_var_loss']:.2f}",
-                    "l2": f"{metrics['l2_loss']:.2f}",
+                    "gnorm": f"{metrics['grad_norm_loss']:.2f}",
                     "constraint": f"{metrics['constraint_violation_mean']:+.4f}",
                 }
             )

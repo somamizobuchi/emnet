@@ -31,9 +31,6 @@ class EyeMovementNet(nn.Module):
         v1_temporal_length: int,
         rgc_delay: int = 0,
         v1_delay: int = 0,
-        rgc_n_basis: int = 0,
-        v1_n_basis: int = 0,
-        log_offset: float = 1.0,
         target_firing_rate: float = 1.0,
         rho: float = 1.0,
     ):
@@ -49,9 +46,6 @@ class EyeMovementNet(nn.Module):
             v1_temporal_length (int): Total temporal kernel length for V1 decoder (delay + trainable)
             rgc_delay (int): Trailing zero samples in the RGC temporal kernel (default 0)
             v1_delay (int): Trailing zero samples in the V1 temporal kernel (default 0)
-            rgc_n_basis (int): Raised-cosine basis for RGC (0 = raw taps, default 0)
-            v1_n_basis (int): Raised-cosine basis for V1 (0 = raw taps, default 0)
-            log_offset (float): Log-compression for raised cosine basis (default 1.0)
             target_firing_rate (float): Target firing rate for RGC constraint (default 1.0)
             rho (float): Penalty parameter for Augmented Lagrangian Method (default 1.0)
         """
@@ -73,8 +67,6 @@ class EyeMovementNet(nn.Module):
             n_spatial=roi_size,
             n_temporal=rgc_temporal_length,
             delay=rgc_delay,
-            n_basis=rgc_n_basis,
-            log_offset=log_offset,
             target_firing_rate=target_firing_rate,
             rho=rho,
         )
@@ -84,8 +76,6 @@ class EyeMovementNet(nn.Module):
             out_channels=v1_channels,
             n_temporal=v1_temporal_length,
             delay=v1_delay,
-            n_basis=v1_n_basis,
-            log_offset=log_offset,
         )
 
         self.frame_decoder = FrameDecoder(
@@ -159,16 +149,23 @@ class EyeMovementNet(nn.Module):
         """
         return self.rgc_encoder.compute_spatial_variance()
 
-    def compute_l2_loss(self) -> torch.Tensor:
+    def compute_regularization_loss(self) -> torch.Tensor:
         """
-        Compute L2 regularization loss for V1 spatial and frame decoder weights.
+        Compute regularization loss: L1 for V1 spatial weights, L2 for frame decoder.
 
         Returns:
-            torch.Tensor: Mean of squared weights (scalar)
+            torch.Tensor: Combined regularization loss (scalar)
         """
-        v1_l2 = (self.v1_decoder.spatial_projection.weight**2).mean()
+        v1_l1 = self.v1_decoder.spatial_projection.weight.abs().mean()
         frame_l2 = (self.frame_decoder.decoder.weight**2).mean()
-        return v1_l2 + frame_l2
+        return v1_l1 + frame_l2
+
+    def compute_temporal_smoothness_loss(self) -> torch.Tensor:
+        """Second-derivative smoothness penalty on raw taps for RGC and V1."""
+        return (
+            self.rgc_encoder.compute_temporal_smoothness_loss()
+            + self.v1_decoder.compute_temporal_smoothness_loss()
+        )
 
     def update_lagrange_multiplier(self, constraint_violation: torch.Tensor) -> None:
         """
