@@ -105,6 +105,12 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "tensorboard" },
+    { name = "torch-tb-profiler" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.8" },
@@ -113,6 +119,12 @@ requires-dist = [
     { name = "torch", specifier = ">=2.9.1" },
     { name = "torch-tb-profiler", specifier = ">=0.4.3" },
     { name = "tqdm", specifier = ">=4.67.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "tensorboard", specifier = ">=2.20.0" },
+    { name = "torch-tb-profiler", specifier = ">=0.4.3" },
 ]
 
 [[package]]
