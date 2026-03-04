@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils.constraints import make_raised_cosine_basis
-
 
 class RetinalEncoder(nn.Module):
     def __init__(
@@ -12,8 +10,6 @@ class RetinalEncoder(nn.Module):
         n_spatial: int,
         n_temporal: int,
         delay: int = 0,
-        n_basis: int = 0,
-        log_offset: float = 1.0,
         target_firing_rate: float = 1.0,
         rho: float = 1.0,
     ) -> None:
@@ -23,12 +19,6 @@ class RetinalEncoder(nn.Module):
             n_spatial          : Spatial ROI side length (pixels).
             n_temporal         : Total kernel length including delay (samples).
             delay              : Trailing zero samples enforcing a causal delay.
-            n_basis            : Raised-cosine basis functions.
-                                 0 (default) = raw tap parameterisation.
-                                 >0          = basis parameterisation; the kernel
-                                 is always B @ coeffs, guaranteeing smooth kernels.
-            log_offset         : Log-compression for the raised cosine basis
-                                 (default 1.0; larger → more linear spacing).
             target_firing_rate : Target mean firing rate for ALM constraint.
             rho                : ALM penalty parameter.
         """
@@ -43,28 +33,17 @@ class RetinalEncoder(nn.Module):
         self.rho = rho
 
         # ------------------------------------------------------------------
-        # Temporal parameterisation
+        # Temporal parameterisation (raw taps)
         # ------------------------------------------------------------------
-        if n_basis > 0:
-            assert n_basis <= self.T_train, "n_basis must be <= n_temporal - delay"
-            self.n_basis = n_basis
-            basis = make_raised_cosine_basis(self.T_train, n_basis, log_offset)
-            self.register_buffer("basis", basis)          # (T_train, n_basis), fixed
-            self.temporal_coeffs = nn.Parameter(          # (N, n_basis), learned
-                torch.empty(self.N, n_basis)
+        self.temporal_weight = nn.Parameter(          # (N, 1, T_train), learned
+            torch.empty(self.N, 1, self.T_train)
+        )
+        nn.init.normal_(self.temporal_weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            temp = self.temporal_weight.squeeze(1)
+            self.temporal_weight.copy_(
+                (temp / (temp.norm(dim=1, keepdim=True) + 1e-8)).unsqueeze(1)
             )
-            nn.init.normal_(self.temporal_coeffs, mean=0.0, std=0.01)
-        else:
-            self.n_basis = 0
-            self.temporal_weight = nn.Parameter(          # (N, 1, T_train), learned
-                torch.empty(self.N, 1, self.T_train)
-            )
-            nn.init.normal_(self.temporal_weight, mean=0.0, std=0.01)
-            with torch.no_grad():
-                temp = self.temporal_weight.squeeze(1)
-                self.temporal_weight.copy_(
-                    (temp / (temp.norm(dim=1, keepdim=True) + 1e-8)).unsqueeze(1)
-                )
 
         # ------------------------------------------------------------------
         # Spatial projection
@@ -92,11 +71,7 @@ class RetinalEncoder(nn.Module):
 
     def _trainable_taps(self) -> torch.Tensor:
         """Return the (N, T_train) trainable portion of the kernel."""
-        if self.n_basis > 0:
-            # basis: (T_train, n_basis), coeffs: (N, n_basis) → (N, T_train)
-            return self.temporal_coeffs @ self.basis.T
-        else:
-            return self.temporal_weight.squeeze(1)  # (N, T_train)
+        return self.temporal_weight.squeeze(1)  # (N, T_train)
 
     def _full_kernel(self) -> torch.Tensor:
         """Return the full (N, 1, T) kernel with trailing zeros for the delay.
@@ -106,7 +81,7 @@ class RetinalEncoder(nn.Module):
         D zeros at the end therefore forces the output to ignore the D most
         recent samples, implementing a causal delay of D steps.
         """
-        taps = self._trainable_taps().unsqueeze(1)  # (N, 1, T_train)
+        taps = self.temporal_weight  # (N, 1, T_train)
         if self.D == 0:
             return taps
         zeros = torch.zeros(self.N, 1, self.D, device=taps.device, dtype=taps.dtype)
@@ -196,6 +171,12 @@ class RetinalEncoder(nn.Module):
         assert isinstance(lm, torch.Tensor)
         return lm
 
+    def compute_temporal_smoothness_loss(self) -> torch.Tensor:
+        """Second-derivative penalty on raw taps."""
+        taps = self._trainable_taps()  # (N, T_train)
+        d2 = taps[:, :-2] - 2 * taps[:, 1:-1] + taps[:, 2:]
+        return (d2**2).mean()
+
     def normalize_kernels(self):
         """Normalize spatial and temporal kernels to unit L2 norm per channel."""
         with torch.no_grad():
@@ -205,17 +186,12 @@ class RetinalEncoder(nn.Module):
                 self.spatial_projection.weight / (spatial_norm + 1e-8)
             )
 
-            # Temporal: normalize the projected kernel (delay zeros excluded)
+            # Temporal
             taps = self._trainable_taps()          # (N, T_train)
             tap_norm = taps.norm(dim=1, keepdim=True)  # (N, 1)
-            if self.n_basis > 0:
-                self.temporal_coeffs.copy_(
-                    self.temporal_coeffs / (tap_norm + 1e-8)
-                )
-            else:
-                self.temporal_weight.copy_(
-                    (taps / (tap_norm + 1e-8)).unsqueeze(1)
-                )
+            self.temporal_weight.copy_(
+                (taps / (tap_norm + 1e-8)).unsqueeze(1)
+            )
 
     def check_for_nans(self) -> dict[str, bool]:
         """
@@ -241,10 +217,7 @@ class RetinalEncoder(nn.Module):
         """
         # W shape: (N, X*X)
         W = self.spatial_projection.weight
-        # Ensure we use the normalized version for variance calculation
-        W_norm = W / (W.norm(dim=1, keepdim=True) + 1e-8)
-        # We look at the "mass" of the squared weights: (N, X, X)
-        W_sq = W_norm.view(self.N, self.X, self.X).pow(2)
+        W_sq = W.view(self.N, self.X, self.X).pow(2)
 
         # Pixel coordinates
         coords = torch.arange(self.X, device=W.device, dtype=W.dtype)

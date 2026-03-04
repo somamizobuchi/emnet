@@ -96,73 +96,50 @@ def stitch_frames_by_position_bilinear(
     img = torch.zeros((img_size, img_size), dtype=dtype, device=device)
     # visibility = torch.zeros((img_size, img_size), dtype=torch.float32, device=device)
 
-    # Create relative patch coordinate meshgrid (computed once, reused 4 times)
+    # Relative patch coordinate meshgrid: (roi_size, roi_size)
     patch_y, patch_x = torch.meshgrid(
         torch.arange(roi_size, device=device),
         torch.arange(roi_size, device=device),
         indexing='ij'
-    )  # Both shape: (roi_size, roi_size)
+    )
 
-    # Four corners: (x_offset, y_offset, weights)
-    corners = [
-        (0, 0, w00),
-        (1, 0, w10),
-        (0, 1, w01),
-        (1, 1, w11),
-    ]
+    # Stack all 4 corner offsets at once: x_offsets/y_offsets shape (4,)
+    x_offsets = torch.tensor([0, 1, 0, 1], device=device, dtype=torch.long)
+    y_offsets = torch.tensor([0, 0, 1, 1], device=device, dtype=torch.long)
+    # weights_all: (4, N)
+    weights_all = torch.stack([w00, w10, w01, w11])
 
-    for dx_offset, dy_offset, weights in corners:
-        x_corners = x0 + dx_offset  # (N,)
-        y_corners = y0 + dy_offset  # (N,)
+    # x_corners, y_corners: (4, N)
+    x_corners = x0.unsqueeze(0) + x_offsets[:, None]
+    y_corners = y0.unsqueeze(0) + y_offsets[:, None]
 
-        # Vectorized bounds check
-        valid = (
-            (x_corners >= 0)
-            & (x_corners + roi_size <= img_size)
-            & (y_corners >= 0)
-            & (y_corners + roi_size <= img_size)
-        )
+    # Valid mask: (4, N) — only frames whose corner patch fits entirely in the image
+    valid = (
+        (x_corners >= 0)
+        & (x_corners + roi_size <= img_size)
+        & (y_corners >= 0)
+        & (y_corners + roi_size <= img_size)
+    )  # (4, N)
 
-        if not valid.any():
-            continue
+    # Flatten corner and frame dims together: process all valid (corner, frame) pairs at once
+    # corner_idx: which corner (0-3), frame_idx: which frame (0-N-1)
+    corner_idx, frame_idx = valid.nonzero(as_tuple=True)  # each (K,)
 
-        # Extract valid frames and their properties
-        valid_x = x_corners[valid]  # (M,) where M = num valid frames
-        valid_y = y_corners[valid]
-        valid_weights = weights[valid]  # (M,)
-        valid_frames = video[valid]  # (M, roi_size, roi_size)
+    if corner_idx.numel() > 0:
+        vx = x_corners[corner_idx, frame_idx]  # (K,)
+        vy = y_corners[corner_idx, frame_idx]  # (K,)
+        vw = weights_all[corner_idx, frame_idx]  # (K,)
+        vf = video[frame_idx]  # (K, roi_size, roi_size)
 
-        # Broadcast to get absolute coordinates for all pixels in all valid frames
-        # Shape expansion: (M,) -> (M, 1, 1), then broadcast with (roi_size, roi_size)
-        abs_x = valid_x[:, None, None] + patch_x[None, :, :]  # (M, roi_size, roi_size)
-        abs_y = valid_y[:, None, None] + patch_y[None, :, :]  # (M, roi_size, roi_size)
+        # Absolute pixel coordinates for each (frame, patch_pixel) pair
+        abs_x = vx[:, None, None] + patch_x[None]  # (K, roi_size, roi_size)
+        abs_y = vy[:, None, None] + patch_y[None]  # (K, roi_size, roi_size)
 
-        # Flatten for indexing
-        abs_x_flat = abs_x.flatten()  # (M * roi_size²,)
-        abs_y_flat = abs_y.flatten()  # (M * roi_size²,)
-
-        # Apply weights and flatten frame values
-        weighted_frames = valid_frames * valid_weights[:, None, None]  # (M, roi_size, roi_size)
-        values_flat = weighted_frames.flatten()  # (M * roi_size²,)
-
-        # Vectorized scatter-add to image using index_put with accumulate=True
+        values_flat = (vf * vw[:, None, None]).flatten()
         img.index_put_(
-            (abs_y_flat, abs_x_flat),
+            (abs_y.flatten(), abs_x.flatten()),
             values_flat,
-            accumulate=True
+            accumulate=True,
         )
-
-        # Scatter-add weights to visibility
-        # weights_broadcast = valid_weights[:, None, None].expand(-1, roi_size, roi_size).flatten()
-        # visibility.index_put_(
-        #     (abs_y_flat, abs_x_flat),
-        #     weights_broadcast,
-        #     accumulate=True
-        # )
-
-    # Normalize by visibility (average overlapping regions)
-    # Use epsilon threshold to avoid numerical instability from very small visibility
-    eps = 1e-8
-    # img = torch.where(visibility > eps, img / visibility, img)
 
     return img

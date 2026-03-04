@@ -14,7 +14,5 @@ class FrameDecoder(nn.Module):
         nn.init.normal_(self.decoder.weight, mean=0.0, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (batch, NI, time)
-        # Transpose to (batch, time, NI) for nn.Linear
-        r = self.decoder(x.transpose(1, 2))  # (batch, time, NI) -> (batch, time, NO)
-        return r
+        # x shape: (batch, NI, time) -> (batch, time, NO)
+        return torch.einsum('bct,oc->bto', x, self.decoder.weight)
