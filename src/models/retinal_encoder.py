@@ -172,9 +172,9 @@ class RetinalEncoder(nn.Module):
         return lm
 
     def compute_temporal_smoothness_loss(self) -> torch.Tensor:
-        """Second-derivative penalty on raw taps."""
-        taps = self._trainable_taps()  # (N, T_train)
-        d2 = taps[:, :-2] - 2 * taps[:, 1:-1] + taps[:, 2:]
+        """Second-derivative penalty on full kernel (including delay zeros)."""
+        kernel = self._full_kernel().squeeze(1)  # (N, T)
+        d2 = kernel[:, :-2] - 2 * kernel[:, 1:-1] + kernel[:, 2:]
         return (d2**2).mean()
 
     def normalize_kernels(self):

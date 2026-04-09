@@ -68,22 +68,19 @@ def plot_spatial_kernels(
 
     weights_reshaped = weights.detach().cpu().view(N, kernel_size, kernel_size)
 
+    # Global normalisation: map [-vmax, vmax] → [0, 1] so relative magnitudes are preserved
+    vmax = weights_reshaped.abs().max()
+    if vmax > 0:
+        weights_norm = (weights_reshaped / vmax) * 0.5 + 0.5
+    else:
+        weights_norm = torch.full_like(weights_reshaped, 0.5)
+
     for i in range(rows):
         for j in range(cols):
             idx = i * cols + j
             if idx < N:
                 x = i * (kernel_size + spacing)
                 y = j * (kernel_size + spacing)
-                k = weights_reshaped[idx]
-
-                # Local normalization to [0, 1] for visibility
-                k_min = k.min()
-                k_max = k.max()
-                if k_max > k_min:
-                    k_norm = (k - k_min) / (k_max - k_min)
-                else:
-                    k_norm = torch.zeros_like(k)
-
-                grid[0, x : x + kernel_size, y : y + kernel_size] = k_norm
+                grid[0, x : x + kernel_size, y : y + kernel_size] = weights_norm[idx]
 
     return grid

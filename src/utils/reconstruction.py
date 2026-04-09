@@ -1,4 +1,57 @@
 import torch
+import torch.nn.functional as F
+
+
+def sample_target_patches(
+    target_img: torch.Tensor,
+    eye_trace: torch.Tensor,
+    roi_size: int,
+) -> torch.Tensor:
+    """
+    Sample patches from target images at eye trace positions (vectorized, GPU-friendly).
+
+    Replaces stitch-then-compare with gather-then-compare: for each frame, crops
+    the corresponding patch from the target image at the eye position. Equivalent
+    to the per-patch reconstruction loss without the scatter/accumulation step.
+
+    Args:
+        target_img (torch.Tensor): Full target images, shape (B, H, W).
+        eye_trace (torch.Tensor): Integer eye positions, shape (B, 2, T) as (x, y).
+        roi_size (int): Size of the patch to extract.
+
+    Returns:
+        torch.Tensor: Target patches, shape (B, T, roi_size, roi_size).
+    """
+    B, H, W = target_img.shape
+    T = eye_trace.shape[2]
+    device = target_img.device
+
+    patch_y, patch_x = torch.meshgrid(
+        torch.arange(roi_size, device=device),
+        torch.arange(roi_size, device=device),
+        indexing='ij',
+    )  # (roi, roi)
+
+    # Absolute pixel coords: (B, T, roi, roi)
+    x_abs = eye_trace[:, 0, :, None, None] + patch_x
+    y_abs = eye_trace[:, 1, :, None, None] + patch_y
+
+    # Normalize to [-1, 1] for grid_sample
+    x_norm = 2.0 * x_abs / (W - 1) - 1.0
+    y_norm = 2.0 * y_abs / (H - 1) - 1.0
+
+    grid = torch.stack([x_norm, y_norm], dim=-1)           # (B, T, roi, roi, 2)
+    grid = grid.reshape(B, T * roi_size, roi_size, 2)
+
+    sampled = F.grid_sample(
+        target_img.unsqueeze(1).float(),                   # (B, 1, H, W)
+        grid,
+        mode='nearest',
+        align_corners=True,
+        padding_mode='border',
+    )  # (B, 1, T*roi, roi)
+
+    return sampled.squeeze(1).reshape(B, T, roi_size, roi_size)
 
 
 def stitch_frames_by_position(
