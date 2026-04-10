@@ -11,7 +11,7 @@ from ..models.direct_model import DirectReconNet
 from ..data.recon_dataset import ReconDataset
 import torch.nn.functional as F
 
-from ..utils.reconstruction import stitch_frames_by_position
+from ..utils.reconstruction import stitch_batch, stitch_frames_by_position
 from ..utils import visualization as viz
 
 
@@ -21,7 +21,6 @@ class DirectTrainer:
 
     Loss = w_recon * L1_recon
          + w_kernel_var * kernel_variance
-         + w_reg * L2_regularization
          + w_temporal_smoothness * temporal_smoothness
 
     recon_mode:
@@ -38,10 +37,10 @@ class DirectTrainer:
         learning_rate: float = 1e-3,
         w_recon: float = 1.0,
         w_kernel_var: float = 1e-3,
-        w_reg: float = 1e-4,
         w_temporal_smoothness: float = 1e-3,
         w_decorr: float = 0.0,
         recon_mode: str = "frames",
+        pseudoinverse: bool = False,
         device: str = "cpu",
         log_dir: Optional[str] = None,
         save_every: Optional[int] = None,
@@ -53,13 +52,13 @@ class DirectTrainer:
         self.device = device
         self.w_recon = w_recon
         self.w_kernel_var = w_kernel_var
-        self.w_reg = w_reg
         self.w_temporal_smoothness = w_temporal_smoothness
         self.w_decorr = w_decorr
 
         if recon_mode not in ("frames", "stitched"):
             raise ValueError(f"recon_mode must be 'frames' or 'stitched', got {recon_mode!r}")
         self.recon_mode = recon_mode
+        self.pseudoinverse = pseudoinverse and recon_mode == "stitched"
 
         # Data loader
         self.dataloader = DataLoader(
@@ -156,7 +155,9 @@ class DirectTrainer:
         frames, target_img, eye_trace = self._get_batch()
 
         # Forward pass
-        reconstructed, rgc_output = self.model(frames, return_intermediates=True)
+        reconstructed, rgc_output = self.model(
+            frames, return_intermediates=True, pseudoinverse=self.pseudoinverse
+        )
 
         # Trim frames to valid convolution length
         pad_start = self.model.get_temporal_reduction()
@@ -167,17 +168,10 @@ class DirectTrainer:
         if self.recon_mode == "frames":
             recon_loss = F.l1_loss(reconstructed, target_patches)
         else:  # "stitched"
-            recon_imgs = torch.stack([
-                stitch_frames_by_position(eye_trace_aligned[b], reconstructed[b], self.model.img_size)
-                for b in range(reconstructed.shape[0])
-            ])
-            target_imgs = torch.stack([
-                stitch_frames_by_position(eye_trace_aligned[b], target_patches[b], self.model.img_size)
-                for b in range(target_patches.shape[0])
-            ])
+            recon_imgs = stitch_batch(eye_trace_aligned, reconstructed, self.model.img_size)
+            target_imgs = stitch_batch(eye_trace_aligned, target_patches, self.model.img_size)
             recon_loss = F.l1_loss(recon_imgs, target_imgs)
         kernel_var_loss = self.model.compute_spatial_variance_loss()
-        reg_loss = self.model.compute_regularization_loss()
         temporal_smoothness_loss = self.model.compute_temporal_smoothness_loss()
         decorr_loss = self._decorrelation_loss(target_patches)
         alm_loss, constraint_violation = self.model.compute_firing_rate_loss(rgc_output)
@@ -185,7 +179,6 @@ class DirectTrainer:
         total_loss = (
             self.w_recon * recon_loss
             + self.w_kernel_var * kernel_var_loss
-            + self.w_reg * reg_loss
             + self.w_temporal_smoothness * temporal_smoothness_loss
             + self.w_decorr * decorr_loss
             + alm_loss
@@ -207,7 +200,6 @@ class DirectTrainer:
             self.writer.add_scalar("loss/total", float(total_loss.item()), self.iteration)
             self.writer.add_scalar("loss/reconstruction", float(recon_loss.item()), self.iteration)
             self.writer.add_scalar("loss/kernel_variance", float(kernel_var_loss.item()), self.iteration)
-            self.writer.add_scalar("loss/regularization", float(reg_loss.item()), self.iteration)
             self.writer.add_scalar("loss/temporal_smoothness", float(temporal_smoothness_loss.item()), self.iteration)
             self.writer.add_scalar("loss/decorrelation", float(decorr_loss.item()), self.iteration)
             self.writer.add_scalar("loss/alm", float(alm_loss.item()), self.iteration)
@@ -274,7 +266,6 @@ class DirectTrainer:
             "total_loss": float(total_loss.item()),
             "recon_loss": float(recon_loss.item()),
             "kernel_var_loss": float(kernel_var_loss.item()),
-            "reg_loss": float(reg_loss.item()),
             "temporal_smoothness_loss": float(temporal_smoothness_loss.item()),
             "decorr_loss": float(decorr_loss.item()),
             "alm_loss": float(alm_loss.item()),
@@ -288,7 +279,7 @@ class DirectTrainer:
         print(f"Batch size: {self.batch_size}")
         print(f"Recon mode: {self.recon_mode}")
         print(f"Loss weights: recon={self.w_recon}, kernel_var={self.w_kernel_var}, "
-              f"reg={self.w_reg}, temporal_smoothness={self.w_temporal_smoothness}")
+              f"temporal_smoothness={self.w_temporal_smoothness}")
         print()
 
         pbar = tqdm(range(max_iterations), desc="Training")
@@ -302,8 +293,6 @@ class DirectTrainer:
                 {
                     "total": f"{metrics['total_loss']:.4f}",
                     "recon": f"{metrics['recon_loss']:.4f}",
-                    "kvar": f"{metrics['kernel_var_loss']:.4f}",
-                    "smooth": f"{metrics['temporal_smoothness_loss']:.4f}",
                 }
             )
 

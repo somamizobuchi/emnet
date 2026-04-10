@@ -1,22 +1,21 @@
-"""Two-stage eye movement model: RetinalEncoder → FrameDecoder (no V1)."""
+"""Symmetric eye movement model: encoder Φ and decoder Φᵀ share the same weights."""
 
 import torch
 import torch.nn as nn
 from typing import Tuple
 
 from .retinal_encoder import RetinalEncoder
-from .frame_decoder import FrameDecoder
 
 
 class DirectReconNet(nn.Module):
     """
-    Two-stage neural network for eye movement-conditioned image reconstruction.
+    Symmetric encoder–decoder for eye movement-conditioned image reconstruction.
 
     Architecture:
-        Input (video frames) → RetinalEncoder → FrameDecoder → Output (reconstructed frames)
+        Input (video frames) → Φ (RetinalEncoder) → nonlinearity → Φᵀ (spatial transpose) → Output
 
-    Skips the V1Decoder stage of EyeMovementNet to study whether the intermediate
-    V1 representation is necessary for reconstruction quality.
+    The encoder Φ maps scene patches to temporal firing-rate codes.
+    The decoder Φᵀ uses the same spatial weights, transposed, to map back.
     """
 
     def __init__(
@@ -29,18 +28,6 @@ class DirectReconNet(nn.Module):
         target_firing_rate: float = 1.0,
         rho: float = 1.0,
     ):
-        """
-        Initialize the direct reconstruction network.
-
-        Args:
-            img_size (int): Size of full image (img_size x img_size)
-            roi_size (int): Size of region-of-interest patches (roi_size x roi_size)
-            rgc_channels (int): Number of retinal ganglion cell channels
-            rgc_temporal_length (int): Total temporal kernel length for RGC encoder (delay + trainable)
-            rgc_delay (int): Trailing zero samples in the RGC temporal kernel (default 0)
-            target_firing_rate (float): Target firing rate for RGC constraint (default 1.0)
-            rho (float): Penalty parameter for Augmented Lagrangian Method (default 1.0)
-        """
         super().__init__()
 
         self.img_size = img_size
@@ -48,7 +35,7 @@ class DirectReconNet(nn.Module):
         self.rgc_channels = rgc_channels
         self.rgc_temporal_length = rgc_temporal_length
 
-        # Temporal reduction: only one convolution stage
+        # Temporal reduction: valid convolution
         self.pad_start = rgc_temporal_length - 1
 
         self.rgc_encoder = RetinalEncoder(
@@ -60,15 +47,11 @@ class DirectReconNet(nn.Module):
             rho=rho,
         )
 
-        self.frame_decoder = FrameDecoder(
-            in_channels=rgc_channels,
-            out_channels=roi_size * roi_size,
-        )
-
     def forward(
         self,
         frames: torch.Tensor,
         return_intermediates: bool = False,
+        pseudoinverse: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass through the two-stage network.
@@ -86,11 +69,19 @@ class DirectReconNet(nn.Module):
                 - reconstructed frames (batch, reduced_time, roi_size, roi_size)
                 - rgc_output (batch, rgc_channels, time - rgc_temporal + 1)
         """
-        # Stage 1: Retinal encoding
-        rgc_output = self.rgc_encoder(frames)  # (batch, rgc_channels, reduced_time)
+        # Encode: Φ (spatial projection + temporal conv + nonlinearity)
+        rgc_output = self.rgc_encoder(frames)  # (batch, N, reduced_time)
 
-        # Stage 2: Frame decoding directly from RGC
-        decoded = self.frame_decoder(rgc_output)  # (batch, reduced_time, roi_size²)
+        # Decode: Φᵀ or Φ⁺ (pseudoinverse)
+        # (batch, N, reduced_time) → (batch, reduced_time, N) → (batch, reduced_time, X²)
+        W = self.rgc_encoder.spatial_projection.weight  # (N, X²)
+        r = rgc_output.transpose(1, 2)  # (batch, reduced_time, N)
+        if pseudoinverse:
+            # Φ⁺ = V Σ⁻¹ Uᵀ  undoes the blur ΦᵀΦ
+            decoded = r @ torch.linalg.pinv(W).T
+        else:
+            # Plain Φᵀ: blurred reconstruction ΦᵀΦ l
+            decoded = r @ W
 
         batch_size, time, _ = decoded.shape
         reconstructed = decoded.reshape(batch_size, time, self.roi_size, self.roi_size)
@@ -125,15 +116,6 @@ class DirectReconNet(nn.Module):
             torch.Tensor: Mean spatial variance (scalar)
         """
         return self.rgc_encoder.compute_spatial_variance()
-
-    def compute_regularization_loss(self) -> torch.Tensor:
-        """
-        Compute regularization loss: L2 for frame decoder weights.
-
-        Returns:
-            torch.Tensor: Regularization loss (scalar)
-        """
-        return (self.frame_decoder.decoder.weight ** 2).mean()
 
     def compute_temporal_smoothness_loss(self) -> torch.Tensor:
         """Second-derivative smoothness penalty on RGC temporal taps."""

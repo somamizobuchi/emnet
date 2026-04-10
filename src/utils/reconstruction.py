@@ -91,6 +91,46 @@ def stitch_frames_by_position(
     return img
 
 
+def stitch_batch(
+    pos: torch.Tensor, video: torch.Tensor, img_size: int
+) -> torch.Tensor:
+    """
+    Batched, vectorized frame stitching via scatter-add.
+
+    Args:
+        pos (torch.Tensor): Integer eye positions, shape (B, 2, T).
+        video (torch.Tensor): Patches, shape (B, T, roi_size, roi_size).
+        img_size (int): Output image side length.
+
+    Returns:
+        torch.Tensor: Stitched images, shape (B, img_size, img_size).
+    """
+    B, T, roi_size, _ = video.shape
+    device = video.device
+
+    # Patch-local offsets: (roi, roi)
+    patch_y, patch_x = torch.meshgrid(
+        torch.arange(roi_size, device=device),
+        torch.arange(roi_size, device=device),
+        indexing="ij",
+    )
+
+    # Absolute pixel coordinates: (B, T, roi, roi)
+    x_abs = pos[:, 0, :, None, None] + patch_x  # broadcast over B, T
+    y_abs = pos[:, 1, :, None, None] + patch_y
+
+    # Flat index into (img_size, img_size)
+    flat_idx = y_abs * img_size + x_abs  # (B, T, roi, roi)
+    flat_idx = flat_idx.reshape(B, -1)   # (B, T*roi*roi)
+
+    values = video.reshape(B, -1)        # (B, T*roi*roi)
+
+    img_flat = torch.zeros(B, img_size * img_size, dtype=video.dtype, device=device)
+    img_flat.scatter_add_(1, flat_idx.long(), values)
+
+    return img_flat.reshape(B, img_size, img_size)
+
+
 def stitch_frames_by_position_bilinear(
     pos: torch.Tensor, video: torch.Tensor, img_size: int
 ) -> torch.Tensor:

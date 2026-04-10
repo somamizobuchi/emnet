@@ -24,18 +24,21 @@ def main():
     pad_start = rgc_temporal_length - 1  # single convolution stage
 
     # Constraint parameters
-    target_firing_rate = 1
+    target_firing_rate = 5.0
     rho = 0
 
     # Loss weights
     w_recon = 1.0
     w_kernel_var = 1e-3
-    w_reg = 0
-    w_temporal_smoothness = 1e-5
+    w_temporal_smoothness = 1e-3
     w_decorr = 1e-4
 
     # Reconstruction loss mode: "frames" or "stitched"
     recon_mode = "frames"
+
+    # Decode with pseudoinverse (Φ⁺ = V Σ⁻¹ Uᵀ) instead of plain transpose (Φᵀ)
+    pseudoinverse = True
+
 
     # Create dataset
     print("Creating dataset...")
@@ -84,10 +87,10 @@ def main():
         learning_rate=2e-3,
         w_recon=w_recon,
         w_kernel_var=w_kernel_var,
-        w_reg=w_reg,
         w_temporal_smoothness=w_temporal_smoothness,
         w_decorr=w_decorr,
         recon_mode=recon_mode,
+        pseudoinverse=pseudoinverse,
         device=device,
         log_dir=log_dir,
         save_every=100_000,
