@@ -2,7 +2,6 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from typing import Tuple
-from tqdm import tqdm
 from utils.eye_movement import generate_brownian_motion, generate_saccade
 from utils.reconstruction import stitch_frames_by_position
 from utils.image_generation import pink_noise_gray_image
@@ -24,6 +23,7 @@ class ReconDataset(Dataset):
         pixels_per_degree: int = 240,
         saccade: bool = False,
         average: bool = False,
+        use_pink: bool = True,
     ):
         """Initialize the dataset with parameters."""
         self.img_size = img_size
@@ -35,14 +35,19 @@ class ReconDataset(Dataset):
         self.pixels_per_degree = pixels_per_degree
         self.saccade = saccade
         self.average = average
+        self.use_pink = use_pink
 
-        imgs = []
-        for _ in tqdm(range(500), desc="Generating images"):
-            img = pink_noise_gray_image(img_size)
-            # Scale to unit standard deviation
-            img = img / (img.std() + 1e-8)
-            imgs.append(img)
-        self.imgs = np.stack(imgs, axis=0).astype(np.float32)
+        pink_imgs = []
+        white_imgs = []
+        print("Generating images...")
+        for _ in range(500):
+            pink, white = pink_noise_gray_image(img_size, return_white=True)
+            pink = pink / (pink.std() + 1e-8)
+            white = white / (white.std() + 1e-8)
+            pink_imgs.append(pink)
+            white_imgs.append(white)
+        self.imgs = np.stack(pink_imgs, axis=0).astype(np.float32)
+        self.white_imgs = np.stack(white_imgs, axis=0).astype(np.float32)
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
@@ -75,8 +80,9 @@ class ReconDataset(Dataset):
               and padding.
             - sacc_end_idx (int): Index where the saccade ends (0 if no saccade).
         """
-        # Generate pink noise gray image
-        img = self.imgs[np.random.randint(0, self.imgs.shape[0])]
+        idx = np.random.randint(0, self.imgs.shape[0])
+        pink_img = self.imgs[idx]
+        img = pink_img if self.use_pink else self.white_imgs[idx]
 
         # Generate eye trace
         eye_trace, sacc_end_idx = self.generate_eye_trace()
@@ -94,14 +100,15 @@ class ReconDataset(Dataset):
         mask = np.full((self.img_size, self.img_size), False)
         for i in range(self.total_samples):
             x, y = eye_trace[:, i]
-            video_frames[i] = img[y : y + self.roi_size, x : x + self.roi_size]
+            video_frames[i] = pink_img[y : y + self.roi_size, x : x + self.roi_size]
             if i >= sacc_end_idx and i >= self.pad_start:
                 if self.average and w is not None:
                     w[y : y + self.roi_size, x : x + self.roi_size] += video_frames[i]
                 mask[y : y + self.roi_size, x : x + self.roi_size] = True
 
         if self.average and w is not None:
-            img = w / (self.total_samples - self.pad_start)
+            pink_img = w / (self.total_samples - self.pad_start)
+            img = pink_img if self.use_pink else img
 
         return (
             torch.from_numpy(video_frames),

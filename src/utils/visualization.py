@@ -84,3 +84,121 @@ def plot_spatial_kernels(
                 grid[0, x : x + kernel_size, y : y + kernel_size] = weights_norm[idx]
 
     return grid
+
+
+def plot_temporal_kernels_freq(
+    weights: torch.Tensor,
+    sampling_frequency: float = 1.0,
+    title: str = "Temporal Kernels — Frequency Domain",
+    delay: int = 0,
+) -> torch.Tensor:
+    """
+    Plot the magnitude spectrum of every temporal kernel overlaid.
+
+    Args:
+        weights: Shape (N, T). Delay taps should be included (they are trimmed
+                 before the FFT so the leading zeros don't bias the spectrum).
+        sampling_frequency: Sampling rate in Hz — sets the x-axis scale.
+        title: Plot title.
+        delay: Number of leading delay taps to strip before the FFT.
+
+    Returns:
+        torch.Tensor: Image tensor of shape (3, H, W).
+    """
+    w = weights.detach().cpu().numpy()
+    if delay > 0:
+        w = w[:, :-delay]  # remove trailing delay zeros
+
+    T = w.shape[1]
+    freqs = np.fft.rfftfreq(T, d=1.0 / sampling_frequency)
+    spectra = np.abs(np.fft.rfft(w, axis=1))  # (N, T//2+1)
+
+    mean_spectrum = spectra.mean(axis=0)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for row in spectra:
+        ax.plot(freqs, row, color="steelblue", alpha=0.15, linewidth=0.8)
+    ax.plot(freqs, mean_spectrum, color="navy", linewidth=1.5, label="mean")
+    ax.set_xlabel("Frequency (Hz)" if sampling_frequency != 1.0 else "Normalised frequency")
+    ax.set_ylabel("|FFT|")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    img = plt.imread(buf)
+    return torch.from_numpy(img[:, :, :3].transpose(2, 0, 1))
+
+
+def _radial_average(power2d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the radial average of a 2D power spectrum (already fftshifted).
+
+    Returns (bin_centers, mean_power) where bin_centers are in cycles/pixel
+    (0 … 0.5).
+    """
+    H, W = power2d.shape
+    cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+    fy = (np.arange(H) - cy) / H  # cycles/pixel, centered
+    fx = (np.arange(W) - cx) / W
+    r = np.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
+
+    max_r = min(cy / H, cx / W)  # largest full ring
+    n_bins = min(H, W) // 2
+    bins = np.linspace(0, max_r, n_bins + 1)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+
+    mean_power = np.zeros(n_bins)
+    for i in range(n_bins):
+        mask = (r >= bins[i]) & (r < bins[i + 1])
+        if mask.any():
+            mean_power[i] = power2d[mask].mean()
+
+    return centers, mean_power
+
+
+def plot_spatial_kernels_freq(
+    weights: torch.Tensor,
+    kernel_size: int,
+) -> torch.Tensor:
+    """
+    Plot the radially-averaged power spectrum of the spatial kernels.
+
+    Each kernel contributes one curve (light blue); the mean across kernels is
+    overlaid in navy. X-axis is spatial frequency in cycles/pixel (0 … 0.5).
+
+    Returns:
+        torch.Tensor: Image tensor of shape (3, H, W).
+    """
+    N = weights.shape[0]
+    w = weights.detach().cpu().view(N, kernel_size, kernel_size).numpy()
+
+    power = np.abs(np.fft.fftshift(np.fft.fft2(w), axes=(-2, -1))) ** 2  # (N, H, W)
+
+    profiles = []
+    for i in range(N):
+        freqs, profile = _radial_average(power[i])
+        profiles.append(profile)
+    profiles = np.array(profiles)  # (N, n_bins)
+    mean_profile = profiles.mean(axis=0)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for p in profiles:
+        ax.plot(freqs, p, color="steelblue", alpha=0.15, linewidth=0.8)
+    ax.plot(freqs, mean_profile, color="navy", linewidth=1.5, label="mean")
+    ax.set_xlabel("Spatial frequency (cycles/pixel)")
+    ax.set_ylabel("Power")
+    ax.set_title("Spatial kernels — radially averaged power spectrum")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    img = plt.imread(buf)
+    return torch.from_numpy(img[:, :, :3].transpose(2, 0, 1))

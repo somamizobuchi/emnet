@@ -18,7 +18,7 @@ def main():
     rgc_delay = 1  # trailing zero samples in RGC temporal kernel
 
     # Dataset parameters
-    diffusion_coefficient = 20.0 / 3600.0
+    diffusion_coefficient = 10.0 / 3600.0
     sampling_frequency = 360
     pixels_per_degree = 240
     pad_start = rgc_temporal_length - 1  # single convolution stage
@@ -29,19 +29,20 @@ def main():
 
     # Loss weights
     w_recon = 1.0
-    w_kernel_var = 1e-3
-    w_temporal_smoothness = 1e-3
-    w_decorr = 1e-4
+    w_kernel_var = 1e-4
+    w_temporal_smoothness = 1e-4
+    w_decorr = 0
 
     # Reconstruction loss mode: "frames" or "stitched"
-    recon_mode = "frames"
+    recon_mode = "stitched"
 
     # Decode with pseudoinverse (Φ⁺ = V Σ⁻¹ Uᵀ) instead of plain transpose (Φᵀ)
     pseudoinverse = True
 
-
     # Create dataset
     print("Creating dataset...")
+    use_pink = False
+
     dataset = ReconDataset(
         img_size=img_size,
         roi_size=roi_size,
@@ -50,6 +51,7 @@ def main():
         diffusion_coefficient=diffusion_coefficient,
         sampling_frequency=sampling_frequency,
         pixels_per_degree=pixels_per_degree,
+        use_pink=use_pink,
     )
 
     # Create model
@@ -74,7 +76,6 @@ def main():
         device = "mps"
     else:
         device = "cpu"
-
 
     # Create timestamped log directory
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")

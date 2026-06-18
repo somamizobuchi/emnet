@@ -38,3 +38,45 @@ def pink_noise_gray_image(
         return pink_img, white_img
 
     return pink_img
+
+
+def spatiotemporal_pink_noise(
+    n_frames: int, size: int, alpha: float = 1.0
+) -> np.ndarray:
+    """
+    Generate a spatiotemporal pink-noise volume.
+
+    Produces a (n_frames, size, size) volume whose 3D power spectrum follows a
+    1/f^alpha law over the combined temporal and spatial frequency magnitude.
+    This is the structureless control counterpart to eye-movement-modulated
+    input: there is no fixation/saccade trajectory, only isotropic 1/f noise in
+    space and time.
+
+    Args:
+        n_frames (int): Number of temporal frames (T).
+        size (int): Spatial side length of each square frame.
+        alpha (float): Power-law exponent. alpha=1 is pink, alpha=0 is white.
+
+    Returns:
+        np.ndarray: Volume of shape (n_frames, size, size), float32, scaled to
+        unit standard deviation.
+    """
+    ft = np.fft.fftfreq(n_frames)
+    fs = np.fft.fftfreq(size)
+
+    # Radial frequency magnitude over (t, y, x)
+    fr = np.sqrt(
+        ft[:, None, None] ** 2
+        + fs[None, :, None] ** 2
+        + fs[None, None, :] ** 2
+    )
+    fr[0, 0, 0] = 1.0  # avoid divide-by-zero at DC
+
+    H = 1.0 / (fr**alpha)
+    H[0, 0, 0] = 0.0  # remove DC component
+
+    phases = np.exp(1j * 2 * np.pi * np.random.rand(n_frames, size, size))
+    volume = np.real(np.fft.ifftn(H * phases))
+
+    volume = volume / (volume.std() + 1e-8)
+    return volume.astype(np.float32)
